@@ -4,7 +4,7 @@ use ai_json_filler_core::{FillSession, Tool};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use ai_json_filler_tools::WebTools;
+use ai_json_filler_tools::{WebMemory, WebTools};
 
 fn names(tools: &[Arc<dyn Tool>]) -> Vec<String> {
     tools.iter().map(|t| t.spec().name.clone()).collect()
@@ -94,4 +94,73 @@ async fn web_tools_register_into_session() {
     session.add_tool(tools[0].clone());
     let specs = session.tool_specs();
     assert!(specs.iter().any(|s| s.name == "web_search"));
+}
+
+fn sample_hit() -> serde_json::Value {
+    serde_json::json!({"title": "T", "url": "https://example.com", "snippet": "C"})
+}
+
+#[tokio::test]
+async fn builder_accepts_external_memory() {
+    let memory = WebMemory::new();
+    let web = WebTools::builder()
+        .tavily_key("k")
+        .memory(memory.clone())
+        .build();
+
+    assert!(web.memory().is_empty());
+    memory.record_search("tavily", "q", 1, 5, &[sample_hit()]);
+    assert_eq!(web.memory().len(), 1);
+    assert_eq!(web.memory().search_count(), 1);
+}
+
+#[tokio::test]
+async fn clear_empties_shared_memory() {
+    let web = WebTools::builder().tavily_key("k").build();
+    web.memory()
+        .record_search("tavily", "q", 1, 5, &[sample_hit()]);
+    web.memory()
+        .record_fetch("tavily", "https://example.com", "body");
+
+    assert_eq!(web.clear(), 2);
+    assert!(web.memory().is_empty());
+    assert!(web.snapshot().searches.is_empty());
+}
+
+#[tokio::test]
+async fn snapshot_exposes_records() {
+    let web = WebTools::builder().tavily_key("k").build();
+    web.memory()
+        .record_search("tavily", "q", 1, 5, &[sample_hit()]);
+
+    let snapshot = web.snapshot();
+    assert_eq!(snapshot.searches.len(), 1);
+    assert_eq!(snapshot.searches[0].query, "q");
+    assert!(snapshot.fetches.is_empty());
+}
+
+#[tokio::test]
+async fn built_tools_share_the_builders_memory() {
+    // The registry is unreachable, so a successful answer proves the cache hit
+    // came from the injected store rather than from the network.
+    let memory = WebMemory::new();
+    memory.record_search("searxng", "q", 1, 5, &[sample_hit()]);
+    let web = WebTools::builder()
+        .searxng_url("http://127.0.0.1:1")
+        .memory(memory)
+        .build();
+
+    let tool = web
+        .tools()
+        .into_iter()
+        .find(|t| t.spec().name == "web_search")
+        .expect("web_search should be registered");
+    let out = tool
+        .call(serde_json::json!({ "query": "q" }))
+        .await
+        .unwrap();
+
+    assert!(!out.is_error, "{}", out.content);
+    let value: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+    assert_eq!(value["cached"], true);
 }

@@ -85,6 +85,30 @@ let outcome = builder.run().await?;
 
 `tool()` は `ai-json-filler-core::Tool`（定義＋実行ハンドラ）を受け取る。`genai::chat::Tool` は定義だけを持ち、実行ハンドラを持たない。既に genai のツール定義とハンドラがある場合は `.genai_tool(tool, handler)` で登録できる。
 
+## 取得結果のキャッシュ
+
+`WebTools::builder()` が作るツール群は 1 つの `WebMemory` を共有する。`web_search` は検索結果を、`web_fetch` は取得した本文を**切り捨て前の全文**で保持する。
+
+- 同じキー（検索は provider / query / page / 件数、取得は URL）の 2 回目以降はネットワークに出ず、保持済みの内容を返す。応答 JSON には `cached: true` が付く。
+- `web_fetch` は全文を持つので、`offset` を進めた続きの取得も再取得なしで返る。
+- 最新の情報が要るときだけ `refresh: true` を付ける。再取得して履歴に追記する（古いレコードは残る）。
+- エラー応答は記録しない。
+
+```rust
+let web = WebTools::from_env();
+// ... fill を実行 ...
+
+let hits = web.memory().search_hits("決算"); // 全検索結果を横断
+let latest = web.memory().latest_fetch("https://example.com/ir");
+let snapshot = web.snapshot(); // searches / fetches のコピー
+
+let removed = web.clear(); // 全件削除（削除件数）
+```
+
+外部公開 API: `memory()` / `searches()` / `fetches()` / `latest_search()` / `latest_fetch()` / `search_hits()` / `snapshot()`。
+
+`clear()` が消すのは**ツール層のキャッシュだけ**で、LLM の会話履歴は消えない。以後の検索・取得は再びネットワークに出る。
+
 ## ターンとラウンド
 
 `GenaiFillBuilder` は 2 つの上限を持つ。

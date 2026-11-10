@@ -4,6 +4,7 @@ use ai_json_filler_core::{BoxFuture, FillError, Tool, ToolOutput, ToolSpec};
 use serde_json::{Value, json};
 
 use crate::http::{build_client, read_json, to_tool_error};
+use crate::memory::WebMemory;
 
 const TAVILY_EXTRACT_URL: &str = "https://api.tavily.com/extract";
 const MAX_URL_BYTES: usize = 2048;
@@ -14,6 +15,7 @@ pub struct FetchTool {
     max_chars: usize,
     allow_private: bool,
     timeout_secs: u64,
+    memory: WebMemory,
 }
 
 enum FetchClient {
@@ -61,7 +63,19 @@ impl FetchTool {
             max_chars: 20_000,
             allow_private: false,
             timeout_secs: 30,
+            memory: WebMemory::new(),
         }
+    }
+
+    /// Injects a shared [`WebMemory`] store used for caching.
+    pub fn with_memory(mut self, memory: WebMemory) -> Self {
+        self.memory = memory;
+        self
+    }
+
+    /// The shared [`WebMemory`] store backing this tool.
+    pub fn memory(&self) -> &WebMemory {
+        &self.memory
     }
 
     pub fn with_max_chars(mut self, n: usize) -> Self {
@@ -90,7 +104,8 @@ impl Tool for FetchTool {
                 "properties": {
                     "url": { "type": "string", "description": "http(s) の絶対 URL" },
                     "max_chars": { "type": "integer", "description": "本文の上限文字数（既定20000）" },
-                    "offset": { "type": "integer", "description": "続きを読む開始位置（文字数）" }
+                    "offset": { "type": "integer", "description": "続きを読む開始位置（文字数）" },
+                    "refresh": { "type": "boolean", "description": "true を付けるとキャッシュを使わず再取得して追記する（既定 false）" }
                 },
                 "required": ["url"]
             }),
@@ -103,6 +118,9 @@ impl Tool for FetchTool {
              - 検索結果の抜粋で足りないときだけ使う\n\
              - 取得は合計3回まで\n\
              - 本文が長くて truncated=true なら next_offset を offset に渡す\n\
+             - 同じ URL を取得し直さない。2 回目以降はキャッシュが返る\n\
+             - 本文の続きは offset だけでよい（再取得されない）\n\
+             - 最新にしたいときだけ refresh=true を付ける\n\
              - 取得に失敗したら同じ URL を繰り返さず、別の情報源に切り替える",
         )
     }
@@ -128,8 +146,20 @@ impl FetchTool {
             .unwrap_or(self.max_chars)
             .clamp(1, 100_000);
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let refresh = args
+            .get("refresh")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
-        match &self.client {
+        // Serve from the cache when the URL was already fetched and a refresh
+        // was not requested. The stored body is the full text, so any `offset`
+        // can be answered without a network round trip.
+        if !refresh && let Some(rec) = self.memory.latest_fetch(url) {
+            let (content, truncated, next_offset) = slice_content(&rec.content, offset, max_chars);
+            return serialize(&self.name, url, &content, truncated, next_offset, true);
+        }
+
+        let markdown = match &self.client {
             FetchClient::Crawl4ai { base_url } => {
                 let body = json!({ "url": url, "f": "fit" });
                 let response = build_client(self.timeout_secs)
@@ -137,15 +167,12 @@ impl FetchTool {
                     .json(&body)
                     .send()
                     .await;
-                let value = match read_json(response).await {
-                    Ok(value) => value,
+                match read_json(response).await {
+                    Ok(value) => parse_crawl4ai(&value)?,
                     Err(message) => {
                         return Ok(ToolOutput::error(format!("FETCH_ERROR: {message}")));
                     }
-                };
-                let markdown = parse_crawl4ai(&value)?;
-                let (content, truncated, next_offset) = slice_content(&markdown, offset, max_chars);
-                serialize(&self.name, url, &content, truncated, next_offset)
+                }
             }
             FetchClient::Tavily { api_key } => {
                 let body = json!({ "urls": [url] });
@@ -155,16 +182,27 @@ impl FetchTool {
                     .json(&body)
                     .send()
                     .await;
-                let value = match read_json(response).await {
-                    Ok(value) => value,
+                match read_json(response).await {
+                    Ok(value) => parse_tavily_extract(&value)?,
                     Err(message) => {
                         return Ok(ToolOutput::error(format!("FETCH_ERROR: {message}")));
                     }
-                };
-                let markdown = parse_tavily_extract(&value)?;
-                let (content, truncated, next_offset) = slice_content(&markdown, offset, max_chars);
-                serialize(&self.name, url, &content, truncated, next_offset)
+                }
             }
+        };
+
+        // Store the untruncated body so later pages never hit the network.
+        self.memory
+            .record_fetch(&self.provider_name(), url, &markdown);
+        let (content, truncated, next_offset) = slice_content(&markdown, offset, max_chars);
+        serialize(&self.name, url, &content, truncated, next_offset, false)
+    }
+
+    /// The provider label recorded against each fetch (`crawl4ai` / `tavily`).
+    fn provider_name(&self) -> String {
+        match &self.client {
+            FetchClient::Crawl4ai { .. } => "crawl4ai".to_string(),
+            FetchClient::Tavily { .. } => "tavily".to_string(),
         }
     }
 }
@@ -334,12 +372,14 @@ fn serialize(
     content: &str,
     truncated: bool,
     next_offset: Option<usize>,
+    cached: bool,
 ) -> Result<ToolOutput, FillError> {
     let value = json!({
         "url": url,
         "content": content,
         "truncated": truncated,
         "next_offset": next_offset,
+        "cached": cached,
     });
     match serde_json::to_string(&value) {
         Ok(s) => Ok(ToolOutput::success(s)),

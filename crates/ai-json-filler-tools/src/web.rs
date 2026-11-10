@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use ai_json_filler_core::Tool;
 
+use crate::memory::{MemorySnapshot, WebMemory};
 use crate::{FetchTool, SearchTool};
 
 pub struct WebTools {
     tools: Vec<Arc<dyn Tool>>,
+    memory: WebMemory,
 }
 
 impl WebTools {
@@ -29,6 +31,24 @@ impl WebTools {
         self.tools.clone()
     }
 
+    /// The store shared by every tool in this set.
+    pub fn memory(&self) -> &WebMemory {
+        &self.memory
+    }
+
+    /// A copy of every cached search and fetch record.
+    pub fn snapshot(&self) -> MemorySnapshot {
+        self.memory.snapshot()
+    }
+
+    /// Removes every cached record and returns the number removed.
+    ///
+    /// Only this tool-layer cache is cleared; the LLM conversation history is
+    /// untouched.
+    pub fn clear(&self) -> usize {
+        self.memory.clear()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
@@ -49,6 +69,7 @@ pub struct WebToolsBuilder {
     searxng_url: Option<String>,
     crawl4ai_url: Option<String>,
     provider_aliases: bool,
+    memory: Option<WebMemory>,
 }
 
 impl WebToolsBuilder {
@@ -72,7 +93,15 @@ impl WebToolsBuilder {
         self
     }
 
+    /// Uses an existing store instead of creating a fresh one. Every tool built
+    /// by this builder shares it.
+    pub fn memory(mut self, memory: WebMemory) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
     pub fn build(self) -> WebTools {
+        let memory = self.memory.unwrap_or_default();
         let tavily_key = self.tavily_api_key.filter(|k| !k.trim().is_empty());
         let searxng_url = self.searxng_url.filter(|u| !u.trim().is_empty());
         let crawl4ai_url = self.crawl4ai_url.filter(|u| !u.trim().is_empty());
@@ -81,33 +110,47 @@ impl WebToolsBuilder {
 
         match tavily_key.as_deref() {
             Some(key) => {
-                tools.push(Arc::new(SearchTool::default_tavily(key)));
-                tools.push(Arc::new(FetchTool::default_tavily(key)));
+                tools.push(Arc::new(
+                    SearchTool::default_tavily(key).with_memory(memory.clone()),
+                ));
+                tools.push(Arc::new(
+                    FetchTool::default_tavily(key).with_memory(memory.clone()),
+                ));
             }
             None => {
                 if let Some(url) = searxng_url.as_deref() {
-                    tools.push(Arc::new(SearchTool::default_searxng(url)));
+                    tools.push(Arc::new(
+                        SearchTool::default_searxng(url).with_memory(memory.clone()),
+                    ));
                 }
                 if let Some(url) = crawl4ai_url.as_deref() {
-                    tools.push(Arc::new(FetchTool::default_crawl4ai(url)));
+                    tools.push(Arc::new(
+                        FetchTool::default_crawl4ai(url).with_memory(memory.clone()),
+                    ));
                 }
             }
         }
 
         if self.provider_aliases {
             if let Some(key) = tavily_key.as_deref() {
-                tools.push(Arc::new(SearchTool::tavily(key)));
-                tools.push(Arc::new(FetchTool::tavily(key)));
+                tools.push(Arc::new(
+                    SearchTool::tavily(key).with_memory(memory.clone()),
+                ));
+                tools.push(Arc::new(FetchTool::tavily(key).with_memory(memory.clone())));
             }
             if let Some(url) = searxng_url.as_deref() {
-                tools.push(Arc::new(SearchTool::searxng(url)));
+                tools.push(Arc::new(
+                    SearchTool::searxng(url).with_memory(memory.clone()),
+                ));
             }
             if let Some(url) = crawl4ai_url.as_deref() {
-                tools.push(Arc::new(FetchTool::crawl4ai(url)));
+                tools.push(Arc::new(
+                    FetchTool::crawl4ai(url).with_memory(memory.clone()),
+                ));
             }
         }
 
-        WebTools { tools }
+        WebTools { tools, memory }
     }
 
     fn tavily_key_opt(mut self, key: Option<String>) -> Self {

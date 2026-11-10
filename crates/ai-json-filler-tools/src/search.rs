@@ -1,7 +1,9 @@
 use ai_json_filler_core::{BoxFuture, FillError, Tool, ToolOutput, ToolSpec};
 use serde_json::{Value, json};
 
+use crate::WebMemory;
 use crate::http::{build_client, read_json, to_tool_error};
+use crate::memory::SearchHit;
 
 const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
 
@@ -10,6 +12,7 @@ pub struct SearchTool {
     client: SearchClient,
     max_results: usize,
     timeout_secs: u64,
+    memory: WebMemory,
 }
 
 enum SearchClient {
@@ -57,7 +60,19 @@ impl SearchTool {
             client,
             max_results: 5,
             timeout_secs: 30,
+            memory: WebMemory::new(),
         }
+    }
+
+    /// Injects a shared [`WebMemory`] store used for caching.
+    pub fn with_memory(mut self, memory: WebMemory) -> Self {
+        self.memory = memory;
+        self
+    }
+
+    /// The shared [`WebMemory`] store backing this tool.
+    pub fn memory(&self) -> &WebMemory {
+        &self.memory
     }
 
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
@@ -86,7 +101,8 @@ impl Tool for SearchTool {
                 "properties": {
                     "query": { "type": "string", "description": "検索クエリ" },
                     "max_results": { "type": "integer", "description": "取得件数（既定5、最大10）" },
-                    "page": { "type": "integer", "description": "ページ番号（1始まり）。SearXNG のみ対応" }
+                    "page": { "type": "integer", "description": "ページ番号（1始まり）。SearXNG のみ対応" },
+                    "refresh": { "type": "boolean", "description": "true を付けるとキャッシュを使わず再取得して追記する（既定 false）" }
                 },
                 "required": ["query"]
             }),
@@ -99,7 +115,9 @@ impl Tool for SearchTool {
              - 時間で変わる情報は必ずこのツールで調べる\n\
              - 検索は合計5回まで\n\
              - 結果が足りないときは page を増やす（SearXNG のみ）\n\
-             - 検索結果に無い数値を作らない",
+             - 検索結果に無い数値を作らない\n\
+             - 同じ query（同じページ・件数）を繰り返さない。2 回目以降はキャッシュが返る\n\
+             - 最新の情報に更新したいときだけ refresh=true を付ける",
         )
     }
 
@@ -125,7 +143,21 @@ impl SearchTool {
             .unwrap_or(self.max_results)
             .clamp(1, 10);
         // `page` is 1-based; treat 0 and other out-of-range values as page 1.
-        let page = args.get("page").and_then(Value::as_u64).unwrap_or(1).max(1);
+        let page = args.get("page").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+        let refresh = args
+            .get("refresh")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        // Return the cached result without going to the network when it exists
+        // and refresh was not requested.
+        if !refresh
+            && let Some(rec) =
+                self.memory
+                    .latest_search(&self.provider_name(), query, page, max_results)
+        {
+            return serialize(from_record(&rec.provider, &rec.query, &rec.results), true);
+        }
 
         match &self.client {
             SearchClient::Tavily { api_key } => {
@@ -148,7 +180,11 @@ impl SearchTool {
                     .send()
                     .await;
                 match read_json(response).await {
-                    Ok(value) => serialize(parse_tavily(&value, query)),
+                    Ok(value) => {
+                        let out = parse_tavily(&value, query);
+                        record_search(&self.memory, &out, query, page, max_results);
+                        serialize(out, false)
+                    }
                     Err(message) => Ok(ToolOutput::error(format!("SEARCH_ERROR: {message}"))),
                 }
             }
@@ -172,10 +208,22 @@ impl SearchTool {
                 };
                 let response = build_client(self.timeout_secs).get(url).send().await;
                 match read_json(response).await {
-                    Ok(value) => serialize(parse_searxng(&value, query, Some(max_results))),
+                    Ok(value) => {
+                        let out = parse_searxng(&value, query, Some(max_results));
+                        record_search(&self.memory, &out, query, page, max_results);
+                        serialize(out, false)
+                    }
                     Err(message) => Ok(ToolOutput::error(format!("SEARCH_ERROR: {message}"))),
                 }
             }
+        }
+    }
+
+    /// The provider label recorded against each search (`tavily` / `searxng`).
+    fn provider_name(&self) -> String {
+        match &self.client {
+            SearchClient::Tavily { .. } => "tavily".to_string(),
+            SearchClient::Searxng { .. } => "searxng".to_string(),
         }
     }
 }
@@ -215,10 +263,39 @@ fn normalize(r: &Value) -> Option<Value> {
     }))
 }
 
-fn serialize(value: Value) -> Result<ToolOutput, FillError> {
+fn serialize(value: Value, cached: bool) -> Result<ToolOutput, FillError> {
+    let value = json!({
+        "provider": value["provider"],
+        "query": value["query"],
+        "results": value["results"],
+        "cached": cached,
+    });
     match serde_json::to_string(&value) {
         Ok(s) => Ok(ToolOutput::success(s)),
         Err(e) => Err(to_tool_error("web_search", format!("SEARCH_ERROR: {e}"))),
+    }
+}
+
+/// Rebuilds a cached search response from a stored [`SearchHit`] list.
+fn from_record(provider: &str, query: &str, hits: &[SearchHit]) -> Value {
+    json!({
+        "provider": provider,
+        "query": query,
+        "results": hits.iter().map(|h| json!({
+            "title": h.title,
+            "url": h.url,
+            "snippet": h.snippet,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Records a successful search run under the hood of the tool.
+fn record_search(memory: &WebMemory, value: &Value, query: &str, page: usize, max_results: usize) {
+    if let (Some(provider), Some(results)) = (
+        value.get("provider").and_then(Value::as_str),
+        value.get("results").and_then(Value::as_array),
+    ) {
+        memory.record_search(provider, query, page, max_results, results);
     }
 }
 
