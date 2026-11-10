@@ -1,0 +1,17 @@
+[package]
+name = "ai-json-filler-genai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "genai integration for ai-json-filler-core"
+
+[dependencies]
+ai-json-filler-core.workspace = true
+genai.workspace = true
+serde.workspace = true
+schemars.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+ai-json-filler-tools = { path = "../ai-json-filler-tools", version = "0.1.0" }

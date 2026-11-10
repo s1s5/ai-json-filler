@@ -1,0 +1,16 @@
+[package]
+name = "ai-json-filler-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Web search and fetch tools for ai-json-filler"
+
+[dependencies]
+ai-json-filler-core.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+serde.workspace = true
+schemars.workspace = true
