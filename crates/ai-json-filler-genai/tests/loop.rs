@@ -469,3 +469,61 @@ async fn fills_vec_struct_with_append_and_update() {
     );
     assert_eq!(outcome.save_calls, 2);
 }
+
+#[derive(Debug, Deserialize, JsonSchema, PartialEq)]
+struct CompanyOpt {
+    name: String,
+    employees: Option<u32>,
+}
+
+#[tokio::test]
+async fn builder_forwards_goal_fields() {
+    let backend = Arc::new(ScriptedBackend::new(vec![
+        response(vec![tool_call(
+            "1",
+            "save_result",
+            json!({"name": "トヨタ"}),
+        )]),
+        response(vec![tool_call(
+            "2",
+            "save_result",
+            json!({"employees": 370000}),
+        )]),
+    ]));
+
+    let outcome = match fill_with_backend::<CompanyOpt>(backend.clone(), "調べて")
+        .goal_fields(["employees"])
+        .run()
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => panic!("expected success, got {err}"),
+    };
+
+    assert_eq!(
+        outcome.value,
+        CompanyOpt {
+            name: "トヨタ".to_string(),
+            employees: Some(370000),
+        }
+    );
+    assert_eq!(outcome.save_calls, 2, "1回目では完了しないはず");
+    let requests = backend.requests();
+    assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
+async fn builder_rejects_unknown_goal_field() {
+    let backend = Arc::new(ScriptedBackend::new(vec![]));
+    match fill_with_backend::<CompanyOpt>(backend, "調べて")
+        .goal_fields(["nope"])
+        .run()
+        .await
+    {
+        Ok(_) => panic!("unknown goal field must be rejected"),
+        Err(err) => assert!(
+            matches!(err, ai_json_filler_core::FillError::UnknownGoalField { .. }),
+            "{err}"
+        ),
+    }
+}

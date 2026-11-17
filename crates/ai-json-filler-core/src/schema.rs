@@ -158,6 +158,60 @@ impl FillSchema {
         }
     }
 
+    /// The property names the object at `loc` may hold.
+    ///
+    /// `loc` is an instance path taken from a validation error: empty (the
+    /// root object) or `[i]` (an array element). Local `$ref`s are resolved.
+    /// `None` means the location cannot be resolved, so callers must not guess.
+    pub(crate) fn properties_at(&self, loc: &Location) -> Option<&serde_json::Map<String, Value>> {
+        let mut node = &self.full;
+        for segment in loc.iter() {
+            let obj = resolve_schema_node(&self.full, node)?;
+            node = match segment {
+                LocationSegment::Property(name) => {
+                    obj.get("properties")?.as_object()?.get(name.as_ref())?
+                }
+                LocationSegment::Index(_) => obj.get("items")?,
+            };
+        }
+        resolve_schema_node(&self.full, node)?
+            .get("properties")?
+            .as_object()
+    }
+
+    /// The property name that `key` was most likely meant to be.
+    ///
+    /// A property matching `key` with its trailing `.` removed wins.
+    /// Otherwise the property within edit distance 2 is returned (ties go to
+    /// the shorter name, then to the lexicographically smaller one). `None`
+    /// means there is nothing close enough, so the caller should stay silent.
+    pub(crate) fn suggest_property(&self, loc: &Location, key: &str) -> Option<String> {
+        let properties = self.properties_at(loc)?;
+        let trimmed = key.trim_end_matches('.');
+        if trimmed != key && properties.contains_key(trimmed) {
+            return Some(trimmed.to_string());
+        }
+
+        let mut best: Option<(usize, &str)> = None;
+        for name in properties.keys() {
+            let distance = edit_distance(key, name);
+            if distance > 2 {
+                continue;
+            }
+            let closer = match best {
+                None => true,
+                Some((best_distance, best_name)) => {
+                    (distance, name.chars().count(), name.as_str())
+                        < (best_distance, best_name.chars().count(), best_name)
+                }
+            };
+            if closer {
+                best = Some((distance, name.as_str()));
+            }
+        }
+        best.map(|(_, name)| name.to_string())
+    }
+
     pub(crate) fn validator(&self) -> &Validator {
         &self.validator
     }
@@ -458,6 +512,36 @@ fn resolve_local_ref_checked<'a>(
         path: display_path_for_schema(path),
         reason: format!("$ref target '{r}' not found"),
     })
+}
+
+/// Follow local `$ref`s until a concrete node is reached, so callers can
+/// read `properties` / `items` without caring where the object is defined.
+fn resolve_schema_node<'a>(root: &'a Value, node: &'a Value) -> Option<&'a Value> {
+    let mut current = node;
+    for _ in 0..8 {
+        match current.get("$ref").and_then(Value::as_str) {
+            Some(reference) => current = resolve_local_ref(root, reference)?,
+            None => return Some(current),
+        }
+    }
+    None
+}
+
+/// Levenshtein distance, counted in characters.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substitute = previous[j] + usize::from(ca != cb);
+            current[j + 1] = substitute.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
 }
 
 /// The `required` names of an object node, empty when absent.

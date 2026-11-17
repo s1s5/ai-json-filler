@@ -144,10 +144,26 @@ fn with_defs(mut schema: Value, partial: &Value) -> Value {
     schema
 }
 
-pub(crate) fn parse_append(args: &Value) -> Result<Vec<Value>, String> {
+/// A parsed tool argument plus the keys the wrapper does not accept.
+///
+/// The wrapper schemas declare `additionalProperties: false`, so unknown keys
+/// are reported to the model instead of being dropped silently.
+pub(crate) struct Parsed<T> {
+    pub value: T,
+    pub extras: Vec<String>,
+}
+
+impl<T> Parsed<T> {
+    fn new(value: T, extras: Vec<String>) -> Self {
+        Self { value, extras }
+    }
+}
+
+pub(crate) fn parse_append(args: &Value) -> Result<Parsed<Vec<Value>>, String> {
     let obj = args
         .as_object()
         .ok_or_else(|| "引数は JSON オブジェクトで送ってください。".to_string())?;
+    let extras = extra_keys(obj, &["items"]);
     let items = obj
         .get("items")
         .and_then(Value::as_array)
@@ -158,13 +174,14 @@ pub(crate) fn parse_append(args: &Value) -> Result<Vec<Value>, String> {
     if items.iter().any(|item| !item.is_object()) {
         return Err("items の各要素は JSON オブジェクトで送ってください。".to_string());
     }
-    Ok(items.clone())
+    Ok(Parsed::new(items.clone(), extras))
 }
 
-pub(crate) fn parse_update(args: &Value) -> Result<(usize, Value), String> {
+pub(crate) fn parse_update(args: &Value) -> Result<Parsed<(usize, Value)>, String> {
     let obj = args
         .as_object()
         .ok_or_else(|| "引数は JSON オブジェクトで送ってください。".to_string())?;
+    let extras = extra_keys(obj, &["index", "patch"]);
     let index = parse_index(obj)?;
     let patch = obj
         .get("patch")
@@ -173,14 +190,35 @@ pub(crate) fn parse_update(args: &Value) -> Result<(usize, Value), String> {
     if patch.is_empty() {
         return Err("patch が空です。更新するフィールドを送ってください。".to_string());
     }
-    Ok((index, Value::Object(patch.clone())))
+    Ok(Parsed::new((index, Value::Object(patch.clone())), extras))
 }
 
-pub(crate) fn parse_remove(args: &Value) -> Result<usize, String> {
+pub(crate) fn parse_remove(args: &Value) -> Result<Parsed<usize>, String> {
     let obj = args
         .as_object()
         .ok_or_else(|| "引数は JSON オブジェクトで送ってください。".to_string())?;
-    parse_index(obj)
+    let extras = extra_keys(obj, &["index"]);
+    let index = parse_index(obj)?;
+    Ok(Parsed::new(index, extras))
+}
+
+/// Keys of the wrapper argument that the tool does not declare.
+fn extra_keys(obj: &serde_json::Map<String, Value>, allowed: &[&str]) -> Vec<String> {
+    let mut extras: Vec<String> = obj
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    extras.sort();
+    extras
+}
+
+/// Feedback for a wrapper call that carried undeclared keys.
+pub(crate) fn extra_args_message(tool: &str, extras: &[String], allowed: &str) -> String {
+    format!(
+        "{tool} の引数に使えないキーがあります: {}（使えるのは {allowed} だけです）",
+        extras.join(", ")
+    )
 }
 
 fn parse_index(obj: &serde_json::Map<String, Value>) -> Result<usize, String> {

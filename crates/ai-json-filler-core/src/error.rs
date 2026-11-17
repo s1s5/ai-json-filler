@@ -12,6 +12,10 @@ pub enum FillError {
     Schema(String),
     #[error("invalid seed: {issues:?}")]
     InvalidSeed { issues: Vec<ValidationIssue> },
+    #[error("invalid goal path: {path}（`field` または `[].field` の形で指定してください）")]
+    InvalidGoalPath { path: String },
+    #[error("unknown goal field: {path}（スキーマに存在しません）")]
+    UnknownGoalField { path: String },
     #[error("fill is not complete")]
     Incomplete { partial: Value },
     #[error("目標達成は不可能と判断されました: {reason}")]

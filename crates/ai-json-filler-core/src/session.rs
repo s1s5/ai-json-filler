@@ -5,12 +5,14 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use jsonschema::paths::Location;
-
-use crate::feedback::{FeedbackOptions, empty_args_feedback, format_validation_feedback};
+use crate::feedback::{
+    FeedbackOptions, empty_args_feedback, extra_key_path, format_validation_feedback,
+    goal_feedback, goal_section, rejected_extra_keys_feedback,
+};
 use crate::give_up::{self, DEFAULT_GIVE_UP_TOOL_NAME, GiveUp};
+use crate::goal::{self, GoalEmpty, GoalPath, GoalReport};
 use crate::prompt::{SAVE_DESCRIPTION, build_system_prompt, guide_section};
-use crate::schema::{GuideOptions, collect_extra_keys, deep_merge, display_path, strip_extra_keys};
+use crate::schema::{GuideOptions, collect_extra_keys, deep_merge, strip_extra_keys};
 use crate::{
     ArrayToolNames, DEFAULT_SAVE_TOOL_NAME, FillError, FillSchema, RootKind, Tool, ToolSet,
     ToolSpec,
@@ -28,6 +30,19 @@ pub enum SessionResult {
         reason: String,
         missing_fields: Vec<String>,
     },
+}
+
+/// What a save does when it carries keys the schema does not declare.
+///
+/// Dropping them silently loses data while still reporting success, so the
+/// default is [`ExtraKeys::Reject`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExtraKeys {
+    /// Drop the extra keys and save the rest when nothing else is wrong.
+    Strip,
+    /// Refuse the save, name the keys, and suggest the closest property.
+    #[default]
+    Reject,
 }
 
 pub struct FillOutcome<T> {
@@ -49,6 +64,9 @@ pub struct FillSession<T> {
     give_up_min_tool_calls: Option<usize>,
     tool_calls: usize,
     feedback: FeedbackOptions,
+    extra_keys: ExtraKeys,
+    goal_fields: Vec<GoalPath>,
+    goal_empty: GoalEmpty,
     warnings: Vec<String>,
     save_calls: usize,
     done: bool,
@@ -95,6 +113,9 @@ where
             give_up_min_tool_calls: None,
             tool_calls: 0,
             feedback: FeedbackOptions::default(),
+            extra_keys: ExtraKeys::default(),
+            goal_fields: Vec::new(),
+            goal_empty: GoalEmpty::default(),
             warnings: Vec::new(),
             save_calls: 0,
             done: false,
@@ -107,6 +128,56 @@ where
     pub fn with_feedback_options(mut self, options: FeedbackOptions) -> Self {
         self.feedback = options;
         self
+    }
+
+    /// How saves that carry undeclared keys are handled. Defaults to
+    /// [`ExtraKeys::Reject`].
+    pub fn with_extra_keys(mut self, policy: ExtraKeys) -> Self {
+        self.extra_keys = policy;
+        self
+    }
+
+    pub fn extra_keys(&self) -> ExtraKeys {
+        self.extra_keys
+    }
+
+    /// Declare the fields that must hold a value before the session finishes.
+    ///
+    /// Notation is `field` in object mode and `[].field` in array mode. A
+    /// mismatch with the root kind, any other notation, or a name the schema
+    /// does not declare is an error at construction time: an impossible goal
+    /// would keep the session from ever finishing.
+    ///
+    /// A field counts as filled when the value exists, is not `null`, and is
+    /// not `""`. `" "`, `0`, `false`, `[]`, and `{}` all count as filled.
+    pub fn with_goal_fields<I, S>(mut self, fields: I) -> Result<Self, FillError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut paths = Vec::new();
+        for spec in fields {
+            let path = GoalPath::parse(spec.as_ref(), self.schema.root_kind())?;
+            goal::check_against_schema(&path, &self.schema)?;
+            paths.push(path);
+        }
+        self.goal_fields = paths;
+        Ok(self)
+    }
+
+    /// Whether an array session may finish with zero elements.
+    ///
+    /// Defaults to [`GoalEmpty::Pass`]. [`GoalEmpty::Fail`] only requires at
+    /// least one element; it is not a general item-count limit, and it has no
+    /// effect in object mode.
+    pub fn with_goal_empty(mut self, policy: GoalEmpty) -> Self {
+        self.goal_empty = policy;
+        self
+    }
+
+    /// The declared goal fields, in the order they were given.
+    pub fn goal_fields(&self) -> &[GoalPath] {
+        &self.goal_fields
     }
 
     /// Whether the system prompt lists the fields to fill. Defaults to `true`.
@@ -297,17 +368,46 @@ where
             ),
         };
         match self.schema.validate(&self.accumulated) {
-            Ok(()) => format!("JSONはまだ完了していません。{action}結果を保存してください。"),
+            Ok(()) => match self.unsatisfied_goals(&self.accumulated) {
+                Some(report) => {
+                    goal_feedback(&report, &self.save_tool_name, &self.array_tool_names)
+                }
+                None => format!("JSONはまだ完了していません。{action}結果を保存してください。"),
+            },
             Err(issues) => {
                 let lines: Vec<String> = issues
                     .iter()
                     .map(|issue| format!("- {}: {} ({})", issue.path, issue.keyword, issue.message))
                     .collect();
-                format!(
-                    "JSONはまだ埋まっていません。現在の検証エラー:\n{}\n{action}不足分を保存してください。\nどうしても埋められない場合は {} を呼んで理由を報告してください。",
-                    lines.join("\n"),
-                    self.give_up_tool_name
-                )
+                let mut out = format!(
+                    "JSONはまだ埋まっていません。現在の検証エラー:\n{}",
+                    lines.join("\n")
+                );
+                // ゴール不足もここに出さないと、ツール無し応答が空回りする。
+                let mut has_goal_section = false;
+                if let Some(report) = self.unsatisfied_goals(&self.accumulated) {
+                    out.push('\n');
+                    out.push_str(&goal_section(
+                        &report,
+                        &self.save_tool_name,
+                        &self.array_tool_names,
+                    ));
+                    has_goal_section = true;
+                }
+                // ゴール節が「次に取るべき操作」を既に出しているので、
+                // 同じことを二度書かない。
+                if has_goal_section {
+                    out.push_str(&format!(
+                        "\nどうしても埋められない場合は {} を呼んで理由を報告してください。",
+                        self.give_up_tool_name
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "\n{action}不足分を保存してください。\nどうしても埋められない場合は {} を呼んで理由を報告してください。",
+                        self.give_up_tool_name
+                    ));
+                }
+                out
             }
         }
     }
@@ -412,10 +512,16 @@ where
 
     fn append(&mut self, args: Value) -> SessionResult {
         self.save_calls += 1;
-        let items = match crate::array::parse_append(&args) {
-            Ok(items) => items,
+        let parsed = match crate::array::parse_append(&args) {
+            Ok(parsed) => parsed,
             Err(message) => return validation_error(message),
         };
+        if let Some(result) =
+            reject_extra_args(&self.array_tool_names.append, &parsed.extras, "items")
+        {
+            return result;
+        }
+        let items = parsed.value;
         let mut candidate = self.accumulated.clone();
         let Some(array) = candidate.as_array_mut() else {
             return validation_error("内部状態が配列ではありません。".to_string());
@@ -432,10 +538,18 @@ where
 
     fn update(&mut self, args: Value) -> SessionResult {
         self.save_calls += 1;
-        let (index, patch) = match crate::array::parse_update(&args) {
-            Ok(update) => update,
+        let parsed = match crate::array::parse_update(&args) {
+            Ok(parsed) => parsed,
             Err(message) => return validation_error(message),
         };
+        if let Some(result) = reject_extra_args(
+            &self.array_tool_names.update,
+            &parsed.extras,
+            "index, patch",
+        ) {
+            return result;
+        }
+        let (index, patch) = parsed.value;
         let len = self.accumulated.as_array().map(Vec::len).unwrap_or(0);
         if index >= len {
             return SessionResult::Continue {
@@ -454,10 +568,16 @@ where
 
     fn remove(&mut self, args: Value) -> SessionResult {
         self.save_calls += 1;
-        let index = match crate::array::parse_remove(&args) {
-            Ok(index) => index,
+        let parsed = match crate::array::parse_remove(&args) {
+            Ok(parsed) => parsed,
             Err(message) => return validation_error(message),
         };
+        if let Some(result) =
+            reject_extra_args(&self.array_tool_names.remove, &parsed.extras, "index")
+        {
+            return result;
+        }
+        let index = parsed.value;
         let len = self.accumulated.as_array().map(Vec::len).unwrap_or(0);
         if index >= len {
             return SessionResult::Continue {
@@ -474,44 +594,109 @@ where
         self.commit_candidate(candidate, &prefix)
     }
 
-    /// Validate a candidate, strip extra keys, and commit it.
+    /// Validate a candidate, apply the extra-key policy, and commit it.
     ///
     /// `prefix` is the operation result shown above validation feedback (for
-    /// example, `追加しました（[0]）`). It is empty for object-mode saves.
-    fn commit_candidate(&mut self, mut candidate: Value, prefix: &str) -> SessionResult {
+    /// example, `追加しました（[0]）`). It is empty for object-mode saves and is
+    /// never shown when the save is rejected, because nothing was committed.
+    fn commit_candidate(&mut self, candidate: Value, prefix: &str) -> SessionResult {
         if self.schema.validate(&candidate).is_ok() {
-            self.accumulated = candidate;
-            self.done = true;
-            return SessionResult::Done {
-                content: self.done_content(),
-            };
+            return self.finish_if_complete(candidate, prefix);
         }
 
         let errors: Vec<_> = self.schema.validator().iter_errors(&candidate).collect();
         let extras = collect_extra_keys(&errors);
-        let removed = strip_extra_keys(&mut candidate, &extras);
-        let errors: Vec<_> = self.schema.validator().iter_errors(&candidate).collect();
-
-        for (loc, key) in &removed {
-            let warning = warning_message(loc, key);
-            if !self.warnings.contains(&warning) {
-                self.warnings.push(warning);
-            }
-        }
-
-        if !removed.is_empty() && errors.is_empty() {
+        if extras.is_empty() {
+            let feedback = format_validation_feedback(&errors, &candidate, &[], &self.feedback);
             self.accumulated = candidate;
-            self.done = true;
-            return SessionResult::Done {
-                content: self.done_content(),
+            return SessionResult::Continue {
+                content: format!("{prefix}{feedback}"),
+                is_error: false,
             };
         }
 
-        let feedback = format_validation_feedback(&errors, &candidate, &removed, &self.feedback);
+        // Reject でも Strip でも「何が余計だったか」は同じに取れる。
+        // Reject では書き換えた候補を捨てる（append が非冪等なのでコミットしない）。
+        let mut stripped = candidate;
+        let removed = strip_extra_keys(&mut stripped, &extras);
+
+        match self.extra_keys {
+            ExtraKeys::Reject => {
+                for (loc, key) in &removed {
+                    self.push_warning(format!(
+                        "余計なキーを拒否しました: {}",
+                        extra_key_path(loc, key)
+                    ));
+                }
+                // コミットしていないので `prefix` は出さない。
+                let feedback =
+                    rejected_extra_keys_feedback(&removed, &self.schema, &self.accumulated);
+                SessionResult::Continue {
+                    content: feedback,
+                    is_error: false,
+                }
+            }
+            ExtraKeys::Strip => {
+                for (loc, key) in &removed {
+                    self.push_warning(format!(
+                        "余計なキーを無視しました: {}",
+                        extra_key_path(loc, key)
+                    ));
+                }
+                self.push_warning(format!("余計なキーを {} 件捨てました", removed.len()));
+
+                let errors: Vec<_> = self.schema.validator().iter_errors(&stripped).collect();
+                if errors.is_empty() {
+                    return self.finish_if_complete(stripped, prefix);
+                }
+
+                let feedback =
+                    format_validation_feedback(&errors, &stripped, &removed, &self.feedback);
+                self.accumulated = stripped;
+                SessionResult::Continue {
+                    content: format!("{prefix}{feedback}"),
+                    is_error: false,
+                }
+            }
+        }
+    }
+
+    /// The goals the candidate does not satisfy, or `None` when all are met.
+    fn unsatisfied_goals(&self, candidate: &Value) -> Option<GoalReport> {
+        if self.goal_fields.is_empty() && self.goal_empty == GoalEmpty::Pass {
+            return None;
+        }
+        let report = goal::missing(&self.goal_fields, self.goal_empty, candidate);
+        (!report.is_satisfied()).then_some(report)
+    }
+
+    /// Commit a schema-valid candidate and finish, unless a goal is unmet.
+    ///
+    /// An unmet goal still commits the candidate (partial commit): the model
+    /// can then fix the saved value with `update` / `save_result` instead of
+    /// appending it again. `done` is not set, so the session keeps accepting
+    /// calls.
+    fn finish_if_complete(&mut self, candidate: Value, prefix: &str) -> SessionResult {
+        if let Some(report) = self.unsatisfied_goals(&candidate) {
+            self.accumulated = candidate;
+            return SessionResult::Continue {
+                content: format!(
+                    "{prefix}{}",
+                    goal_feedback(&report, &self.save_tool_name, &self.array_tool_names)
+                ),
+                is_error: false,
+            };
+        }
         self.accumulated = candidate;
-        SessionResult::Continue {
-            content: format!("{prefix}{feedback}"),
-            is_error: false,
+        self.done = true;
+        SessionResult::Done {
+            content: self.done_content(),
+        }
+    }
+
+    fn push_warning(&mut self, warning: String) {
+        if !self.warnings.contains(&warning) {
+            self.warnings.push(warning);
         }
     }
 
@@ -560,11 +745,16 @@ fn validation_error(message: String) -> SessionResult {
     }
 }
 
-fn warning_message(loc: &Location, key: &str) -> String {
-    let path = display_path(loc);
-    if path == "(root)" {
-        format!("余計なキーを無視しました: {key}")
-    } else {
-        format!("余計なキーを無視しました: {path}.{key}")
+/// Unknown keys of an `append` / `update` / `remove` argument.
+///
+/// The wrapper schemas declare `additionalProperties: false`, so this is
+/// rejected whatever [`ExtraKeys`] says: the policy is about the data being
+/// filled, not about malformed tool arguments.
+fn reject_extra_args(tool: &str, extras: &[String], allowed: &str) -> Option<SessionResult> {
+    if extras.is_empty() {
+        return None;
     }
+    Some(validation_error(crate::array::extra_args_message(
+        tool, extras, allowed,
+    )))
 }

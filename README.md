@@ -109,7 +109,7 @@ println!("{:#?}", outcome.value);
 
 - 部分要素のまま `append` し、後から `update` で必須フィールドを埋められる。
 - `remove` の後は index がずれる。`update` / `remove` は現在の index を指定する。
-- 空配列がスキーマ上妥当なら、空で完了し得る。最低 1 件を要求する場合は `minItems: 1` をスキーマに入れる。
+- 空配列がスキーマ上妥当なら、空で完了し得る。最低 1 件を要求する場合は `minItems: 1` をスキーマに入れるか、`with_goal_empty(GoalEmpty::Fail)` を使う。
 - ツール名は `ArrayToolNames` で変更できる（`with_array_tool_names` / `array_tool_names`）。
 
 ## ツールを使う
@@ -216,6 +216,41 @@ let session = FillSession::<CompanyProfile>::new("調べて")?
 
 `max_description_chars` は既定で無制限。説明文は「何を入れるか」の唯一の手掛かりなので、切るかどうかは呼び出し側が決める。切ったときは `…` が付く。`max_fields` は**任意フィールドだけ**を制限し、超えた分は `…他 N 件（任意フィールド）` と表示する。必須フィールドは常に全部出る。
 
+## 余計キーの扱い
+
+`save_result` / `append` / `update` に、スキーマが宣言していないキーが混ざったときの既定は**拒否**。捨てて保存すると、データが欠けたまま「保存しました」と返ってしまうため。
+
+- `ExtraKeys::Reject`（既定）: 候補をコミットせず `SessionResult::Continue` を返す。余計なキーを名指しし、正しいキー（末尾の `.` を外した名前 → 編集距離 2 以内の近いプロパティ）を提案する。
+- `ExtraKeys::Strip`: 余計キーを捨て、他が妥当なら `Done`。捨てたキーは `FillOutcome::warnings` に `余計なキーを無視しました: confidence.` と件数で残る。
+
+```rust
+use ai_json_filler_core::{ExtraKeys, FillSession};
+
+let session = FillSession::<CompanyProfile>::new("調べて")?
+    .with_extra_keys(ExtraKeys::Strip); // 既定は ExtraKeys::Reject
+```
+
+`append` / `update` / `remove` の**引数**に含まれる余計キー（`{"items": [...], "comment": "x"}` の `comment`）は、ポリシーに関係なく拒否する。ツール定義が `additionalProperties: false` を宣言しているため。
+
+## ゴール項目（`with_goal_fields`）
+
+`required` はスキーマ検証の担当で、`Option<T>` / `#[serde(default)]` のフィールドは 1 つも入らなくても完了してしまう。ゴール項目はその上に「値が存在すること」だけを要求する。`required` でないフィールドも完了条件にできる。
+
+```rust
+use ai_json_filler_core::{FillSession, GoalEmpty};
+
+let session = FillSession::<CompanyProfile>::new("調べて")?
+    .with_goal_fields(["employees", "headquarters"])?; // 構築時に検証される
+```
+
+- 記法は `field`（Object モード）と `[].field`（Array モード）だけ。それ以外の記法、ルート種別との不一致（Object モードの `[].x`、Array モードの素の `x`）、スキーマに無い名前は構築時に `FillError::InvalidGoalPath` / `FillError::UnknownGoalField` で拒否する。永久に充足しないゴールを作らないため。
+- 充足 = 値が存在し、`null` でなく、`""` でない。`" "` / `0` / `false` / `[]` / `{}` は充足。意味・範囲の正しさは判定しない（スキーマ検証の担当）。
+- ゴール未達でも保存はコミットする（部分コミット）。`done` は立たず、不足一覧と「次に取るべき操作」が返る。Array モードで既存要素に不足がある場合は `update` を案内し、`append` は要素が増えるので使わないよう明示する。
+- `[].field`（`GoalPath::EveryElement`）は**現在存在する要素**をすべて検査する。要素数の保証はしない（0 件なら何も検査しない）。最低 1 件を要求するには `with_goal_empty(GoalEmpty::Fail)` を使う。件数の上限・下限は扱わない。`GoalEmpty` の既定は `Pass`。
+- 不足一覧は 5 行まで。超えたら `…他 N 件`。ツール無し応答への差し戻し（`progress_feedback()`）にも同じ一覧と案内を出す。
+- 案内のツール名は設定値（`save_tool_name` / `array_tool_names`）から取る。
+- ゴール未設定なら従来と完全に同じ挙動。埋められない項目をゴールにすると `max_turns` / `max_rounds` まで進んで `FillError::Incomplete` になるので、`give_up` と併用する。
+
 ## 不可能の報告
 
 LLM が「これ以上調べても値が分からない」と判断したときは、`give_up` ツールで理由付きの打ち切りを宣言できる。ループ上限（`max_turns` / `max_rounds`）による打ち切りと区別できるのが目的。
@@ -249,7 +284,7 @@ match fill::<CompanyProfile>(&client, "qwen3:8b", "調べて").run().await {
 - **形状制約**: ルートはフラット object またはフラット object の配列。ネスト object / object 配列 / map / 型未指定は `FillError::UnsupportedSchemaShape` で構築時に拒否する。`$ref` はローカル参照（`#/...`）のみ解決する。
 - **Array モード**: 既定のツール名は `append` / `update` / `remove`。`ArrayToolNames` で変更できる。各ツールの引数スキーマには、`items` の `$ref` を解決できるよう `$defs` / `definitions` をコピーする。`save_calls` は3ツールの呼び出し回数も数える。
 - **seed**: `FillSession::with_seed` は既存の部分データを受け取る。`required` 不足だけを許容し、型違い・enum 違反・余計キーは `FillError::InvalidSeed` で拒否する。
-- **余計キー**: `save_result` / `append` / `update` が送ってきた余計キーは検証前に除去し、`FillOutcome::warnings` に残す。配列要素内の余計キーは `[0].extra` のようにパス付きで記録する。
+- **余計キー**: 既定は `ExtraKeys::Reject`（保存しない）。`FillSession::with_extra_keys(ExtraKeys::Strip)` にすると従来どおり除去して保存し、`FillOutcome::warnings` に `余計なキーを無視しました: confidence.` と件数を残す。配列要素内の余計キーは `[0].extra` のようにパス付きで記録する。`append` / `update` / `remove` の引数側の余計キーは、ポリシーに関係なく拒否する。
 - **`additionalProperties`**: schemars 1 は素の struct に `additionalProperties: false` を付けないため、`FillSchema::for_type` 側で `properties` を持つオブジェクトに注入する。`anyOf` / `oneOf` は再帰し、`allOf` は `unevaluatedProperties: false` を使う。配列ルートでは `items` の object にも適用する。
 - **フィードバック**: 日本語固定。`FeedbackOptions` で件数・文字数上限を変更できる。
 - **バージョン**: `genai = "0.7"`（キャレット）。マイナー更新で API が変わった場合は `ai-json-filler-genai` だけを直す。

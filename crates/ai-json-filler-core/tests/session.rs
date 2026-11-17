@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use ai_json_filler_core::{
-    BoxFuture, FeedbackOptions, FillError, FillSession, GuideOptions, SessionResult, Tool,
-    ToolOutput, ToolSpec,
+    BoxFuture, ExtraKeys, FeedbackOptions, FillError, FillSession, GoalEmpty, GuideOptions,
+    SessionResult, Tool, ToolOutput, ToolSpec,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -73,8 +73,8 @@ async fn completes_in_two_saves() {
 }
 
 #[tokio::test]
-async fn extra_key_is_stripped() {
-    let mut session = new_session();
+async fn strip_extra_key_still_completes() {
+    let mut session = new_session().with_extra_keys(ExtraKeys::Strip);
     let result = session
         .call(
             "save_result",
@@ -87,20 +87,141 @@ async fn extra_key_is_stripped() {
         session.snapshot(),
         &json!({"name": "トヨタ", "employees": 370000})
     );
-    assert_eq!(
-        session.warnings(),
-        &["余計なキーを無視しました: extra".to_string()]
+    assert!(
+        session
+            .warnings()
+            .iter()
+            .any(|warning| warning == "余計なキーを無視しました: extra"),
+        "{:?}",
+        session.warnings()
+    );
+    assert!(
+        session
+            .warnings()
+            .iter()
+            .any(|warning| warning == "余計なキーを 1 件捨てました"),
+        "{:?}",
+        session.warnings()
     );
 }
 
 #[tokio::test]
-async fn warnings_accumulate_before_completion() {
+async fn reject_extra_key_does_not_commit_object() {
     let mut session = new_session();
+    assert_eq!(session.extra_keys(), ExtraKeys::Reject);
+
+    match session
+        .call("save_result", json!({"name": "トヨタ", "extra": true}))
+        .await
+    {
+        SessionResult::Continue { content, is_error } => {
+            assert!(!is_error);
+            assert!(content.contains("保存しませんでした"), "{content}");
+        }
+        _ => panic!("extra key must not finish the session"),
+    }
+
+    // 候補はコミットしない。
+    assert_eq!(session.snapshot(), &json!({}));
+    assert!(
+        session
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("拒否しました") && warning.contains("extra")),
+        "{:?}",
+        session.warnings()
+    );
+    assert!(matches!(
+        session.into_outcome(),
+        Err(FillError::Incomplete { partial }) if partial == json!({})
+    ));
+}
+
+#[tokio::test]
+async fn reject_extra_key_names_the_correct_field() {
+    let mut session = new_session();
+    match session
+        .call("save_result", json!({"name": "トヨタ", "employees.": 1}))
+        .await
+    {
+        SessionResult::Continue { content, .. } => {
+            assert!(
+                content.contains("正しいキーは `employees` です（末尾の `.` を外す）"),
+                "{content}"
+            );
+        }
+        _ => panic!("expected continue"),
+    }
+
+    // 提案どおりに直して送り直せば保存できる（拒否時は候補ごと捨てているので、
+    // name も一緒に送り直す）。
+    match session
+        .call(
+            "save_result",
+            json!({"name": "トヨタ", "employees": 370000}),
+        )
+        .await
+    {
+        SessionResult::Done { .. } => {}
+        other => {
+            let _ = other;
+            panic!("expected done")
+        }
+    }
+    assert_eq!(
+        session.snapshot(),
+        &json!({"name": "トヨタ", "employees": 370000})
+    );
+}
+
+#[tokio::test]
+async fn reject_without_similar_property_has_no_suggestion() {
+    let mut session = new_session();
+    match session
+        .call(
+            "save_result",
+            json!({"name": "トヨタ", "totally_unrelated": 1}),
+        )
+        .await
+    {
+        SessionResult::Continue { content, .. } => {
+            assert!(content.contains("totally_unrelated"), "{content}");
+            assert!(!content.contains("正しいキー"), "{content}");
+            assert!(!content.contains("間違いではありませんか"), "{content}");
+        }
+        _ => panic!("expected continue"),
+    }
+    assert_eq!(session.snapshot(), &json!({}));
+}
+
+#[tokio::test]
+async fn strip_warning_includes_count() {
+    let mut session = new_session().with_extra_keys(ExtraKeys::Strip);
+    let _ = session
+        .call("save_result", json!({"name": "トヨタ", "foo": 1, "bar": 2}))
+        .await;
+
+    assert!(
+        session
+            .warnings()
+            .iter()
+            .any(|warning| warning == "余計なキーを 2 件捨てました"),
+        "{:?}",
+        session.warnings()
+    );
+    // employees はまだ不足しているので終端しない。
+    assert!(!session.is_done());
+    assert_eq!(session.snapshot(), &json!({"name": "トヨタ"}));
+}
+
+#[tokio::test]
+async fn warnings_accumulate_before_completion() {
+    let mut session = new_session().with_extra_keys(ExtraKeys::Strip);
     let first = session
         .call("save_result", json!({"name": "トヨタ", "extra": 1}))
         .await;
     assert!(matches!(first, SessionResult::Continue { .. }));
-    assert_eq!(session.warnings().len(), 1);
+    assert_eq!(session.warnings().len(), 2);
 
     let second = session
         .call("save_result", json!({"employees": 370000}))
@@ -108,7 +229,7 @@ async fn warnings_accumulate_before_completion() {
     assert!(matches!(second, SessionResult::Done { .. }));
 
     let outcome = session.into_outcome().expect("outcome");
-    assert_eq!(outcome.warnings.len(), 1);
+    assert_eq!(outcome.warnings.len(), 2);
     assert!(outcome.warnings[0].contains("extra"));
 }
 
@@ -622,7 +743,7 @@ async fn remove_out_of_range_is_rejected() {
 
 #[tokio::test]
 async fn extra_key_in_append_is_stripped() {
-    let mut session = array_session();
+    let mut session = array_session().with_extra_keys(ExtraKeys::Strip);
     let result = session
         .call("append", json!({"items": [{"name": "A", "extra": true}]}))
         .await;
@@ -636,6 +757,86 @@ async fn extra_key_in_append_is_stripped() {
         "{:?}",
         session.warnings()
     );
+}
+
+#[tokio::test]
+async fn reject_suggests_nearest_property() {
+    let mut session = array_session();
+    match session
+        .call(
+            "append",
+            json!({"items": [{"name": "A", "note": "x", "name_0": "dup"}]}),
+        )
+        .await
+    {
+        SessionResult::Continue { content, .. } => {
+            assert!(content.contains("`[0].name_0`"), "{content}");
+            assert!(
+                content.contains("→ `name` の間違いではありませんか"),
+                "{content}"
+            );
+        }
+        _ => panic!("expected continue"),
+    }
+    assert_eq!(session.snapshot(), &json!([]));
+    assert!(!session.is_done());
+}
+
+#[tokio::test]
+async fn reject_append_does_not_duplicate_items() {
+    let mut session = array_session();
+    assert!(matches!(
+        session
+            .call(
+                "append",
+                json!({"items": [{"name": "A", "note": "a", "bogus": 1}]})
+            )
+            .await,
+        SessionResult::Continue { .. }
+    ));
+    assert_eq!(session.snapshot(), &json!([]));
+
+    match session
+        .call("append", json!({"items": [{"name": "A", "note": "a"}]}))
+        .await
+    {
+        SessionResult::Done { content } => assert!(content.contains("1件"), "{content}"),
+        other => {
+            let _ = other;
+            panic!("expected done")
+        }
+    }
+
+    let outcome = session.into_outcome().expect("outcome");
+    assert_eq!(outcome.value.len(), 1);
+    assert_eq!(outcome.value[0].name, "A");
+}
+
+#[tokio::test]
+async fn wrapper_extra_key_is_rejected() {
+    // Strip を選んでいても、wrapper の宣言と違う引数は拒否する。
+    for policy in [ExtraKeys::Reject, ExtraKeys::Strip] {
+        let mut session = array_session().with_extra_keys(policy);
+        match session
+            .call(
+                "append",
+                json!({"items": [{"name": "A", "note": "a"}], "comment": "hi"}),
+            )
+            .await
+        {
+            SessionResult::Continue { content, .. } => {
+                assert!(content.contains("使えないキー"), "{policy:?}: {content}");
+                assert!(content.contains("comment"), "{policy:?}: {content}");
+                assert!(content.contains("items"), "{policy:?}: {content}");
+            }
+            other => {
+                let _ = other;
+                panic!("{policy:?}: wrapper extra key must be rejected")
+            }
+        }
+        assert_eq!(session.snapshot(), &json!([]));
+        assert!(!session.is_done());
+    }
 }
 
 #[tokio::test]
@@ -741,4 +942,388 @@ fn with_guide_options_changes_output() {
     let truncated = session.system_prompt();
     assert!(truncated.contains("会社名です。…"), "{truncated}");
     assert!(!truncated.contains("とても"), "{truncated}");
+}
+
+#[tokio::test]
+async fn reject_lists_allowed_keys_when_nothing_is_similar() {
+    let mut session = new_session();
+    let result = session
+        .call("save_result", serde_json::json!({"name": "x", "zzzzzz": 1}))
+        .await;
+    let content = match result {
+        SessionResult::Continue { content, .. } => content,
+        SessionResult::Done { content } => panic!("expected continue, got done: {content}"),
+        SessionResult::Impossible { reason, .. } => {
+            panic!("expected continue, got impossible: {reason}")
+        }
+    };
+    assert!(content.contains("`zzzzzz` は使えません"), "{content}");
+    assert!(content.contains("使えるキー: employees, name"), "{content}");
+    assert!(
+        content.contains("この呼び出しは保存していません"),
+        "{content}"
+    );
+    assert!(!content.contains("末尾の `.`"), "{content}");
+}
+
+// --- 修正 06: ゴール項目（with_goal_fields） ---
+
+#[derive(Debug, Deserialize, JsonSchema, PartialEq)]
+struct GoalProfile {
+    name: Option<String>,
+    employees: Option<u32>,
+}
+
+fn goal_profile_session() -> FillSession<GoalProfile> {
+    FillSession::new("会社を調べて").expect("session")
+}
+
+#[derive(Debug, Deserialize, JsonSchema, PartialEq)]
+struct GoalRow {
+    market_key: String,
+    sales_share: Option<String>,
+}
+
+fn goal_array_session(fields: &[&str]) -> FillSession<Vec<GoalRow>> {
+    FillSession::new("行を埋めて")
+        .expect("session")
+        .with_goal_fields(fields.iter().copied())
+        .expect("goals")
+}
+
+#[tokio::test]
+async fn goal_field_blocks_done_object() {
+    let mut session = goal_profile_session()
+        .with_goal_fields(["employees"])
+        .expect("goals");
+    assert_eq!(session.goal_fields().len(), 1);
+    assert_eq!(session.goal_fields()[0].field(), "employees");
+
+    match session.call("save_result", json!({"name": "トヨタ"})).await {
+        SessionResult::Continue { content, is_error } => {
+            assert!(!is_error, "{content}");
+            assert!(content.contains("JSONはまだ完成していません"), "{content}");
+            assert!(content.contains("- employees"), "{content}");
+            assert!(
+                content.contains("save_result に employees を入れて再送してください"),
+                "{content}"
+            );
+        }
+        SessionResult::Done { content } => panic!("goal must block done: {content}"),
+        SessionResult::Impossible { reason, .. } => panic!("unexpected impossible: {reason}"),
+    }
+    assert!(!session.is_done());
+    // 部分コミットはする。
+    assert_eq!(session.snapshot(), &json!({"name": "トヨタ"}));
+}
+
+#[tokio::test]
+async fn goal_field_allows_done_when_filled() {
+    let mut session = goal_profile_session()
+        .with_goal_fields(["employees"])
+        .expect("goals");
+    match session
+        .call(
+            "save_result",
+            json!({"name": "トヨタ", "employees": 370000}),
+        )
+        .await
+    {
+        SessionResult::Done { content } => assert!(content.contains("保存しました"), "{content}"),
+        SessionResult::Continue { content, .. } => panic!("expected done: {content}"),
+        SessionResult::Impossible { .. } => panic!("unexpected impossible"),
+    }
+    let outcome = session.into_outcome().expect("outcome");
+    assert_eq!(
+        outcome.value,
+        GoalProfile {
+            name: Some("トヨタ".to_string()),
+            employees: Some(370000),
+        }
+    );
+}
+
+#[tokio::test]
+async fn goal_every_element_requires_all_rows() {
+    let mut session = goal_array_session(&["[].sales_share"]);
+    match session
+        .call(
+            "append",
+            json!({"items": [
+                {"market_key": "a", "sales_share": "10%"},
+                {"market_key": "b"}
+            ]}),
+        )
+        .await
+    {
+        SessionResult::Continue { content, .. } => {
+            assert!(content.contains("- [1].sales_share"), "{content}");
+            assert!(!content.contains("- [0].sales_share"), "{content}");
+            assert!(
+                content.contains("update で index 1 の patch に sales_share を入れてください"),
+                "{content}"
+            );
+        }
+        SessionResult::Done { content } => panic!("goal must block done: {content}"),
+        SessionResult::Impossible { .. } => panic!("unexpected impossible"),
+    }
+    assert_eq!(
+        session.snapshot(),
+        &json!([{"market_key": "a", "sales_share": "10%"}, {"market_key": "b"}])
+    );
+
+    match session
+        .call(
+            "update",
+            json!({"index": 1, "patch": {"sales_share": "20%"}}),
+        )
+        .await
+    {
+        SessionResult::Done { content } => assert!(content.contains("2件"), "{content}"),
+        SessionResult::Continue { content, .. } => panic!("expected done: {content}"),
+        SessionResult::Impossible { .. } => panic!("unexpected impossible"),
+    }
+}
+
+#[tokio::test]
+async fn goal_empty_string_counts_as_missing() {
+    let mut session = goal_profile_session()
+        .with_goal_fields(["name"])
+        .expect("goals");
+    match session.call("save_result", json!({"name": ""})).await {
+        SessionResult::Continue { content, .. } => {
+            assert!(content.contains("- name"), "{content}");
+            assert!(!session.is_done());
+        }
+        SessionResult::Done { content } => panic!("`\"\"` must be missing: {content}"),
+        SessionResult::Impossible { .. } => panic!("unexpected impossible"),
+    }
+}
+
+#[tokio::test]
+async fn goal_blank_string_counts_as_present() {
+    let mut session = goal_profile_session()
+        .with_goal_fields(["name"])
+        .expect("goals");
+    match session.call("save_result", json!({"name": " "})).await {
+        SessionResult::Done { content } => assert!(content.contains("保存しました"), "{content}"),
+        SessionResult::Continue { content, .. } => panic!("`\" \"` must be present: {content}"),
+        SessionResult::Impossible { .. } => panic!("unexpected impossible"),
+    }
+}
+
+#[tokio::test]
+async fn goal_empty_zero_elements_pass_by_default() {
+    let mut session = goal_array_session(&["[].sales_share"]);
+    assert!(matches!(
+        session
+            .call("append", json!({"items": [{"market_key": "a"}]}))
+            .await,
+        SessionResult::Continue { .. }
+    ));
+    // 最後の要素を消すと 0 件。既定は Pass なので完了できる。
+    match session.call("remove", json!({"index": 0})).await {
+        SessionResult::Done { content } => assert!(content.contains("0件"), "{content}"),
+        SessionResult::Continue { content, .. } => panic!("expected done: {content}"),
+        SessionResult::Impossible { .. } => panic!("unexpected impossible"),
+    }
+    assert_eq!(session.snapshot(), &json!([]));
+}
+
+#[tokio::test]
+async fn goal_empty_fail_requires_one_element() {
+    let mut session = goal_array_session(&["[].sales_share"]).with_goal_empty(GoalEmpty::Fail);
+    assert!(matches!(
+        session
+            .call("append", json!({"items": [{"market_key": "a"}]}))
+            .await,
+        SessionResult::Continue { .. }
+    ));
+    match session.call("remove", json!({"index": 0})).await {
+        SessionResult::Continue { content, is_error } => {
+            assert!(!is_error, "{content}");
+            assert!(content.contains("要素が 1 件もありません"), "{content}");
+            assert!(
+                content.contains("append で1件以上を追加してください"),
+                "{content}"
+            );
+        }
+        SessionResult::Done { content } => panic!("Fail must block zero rows: {content}"),
+        SessionResult::Impossible { .. } => panic!("unexpected impossible"),
+    }
+    assert!(!session.is_done());
+    assert_eq!(session.snapshot(), &json!([]));
+}
+
+#[test]
+fn invalid_goal_path_is_an_error() {
+    for spec in ["a.b", "[0].x", "[]x", "[]", "", "employees[0]"] {
+        match goal_profile_session().with_goal_fields([spec]) {
+            Err(FillError::InvalidGoalPath { path }) => assert_eq!(path, spec),
+            Ok(_) => panic!("{spec:?} must be rejected"),
+            Err(other) => panic!("{spec:?}: unexpected error {other}"),
+        }
+    }
+
+    for spec in ["sales_share", "[].a.b", "[].", "[].[].x"] {
+        let session = FillSession::<Vec<GoalRow>>::new("行を埋めて").expect("session");
+        match session.with_goal_fields([spec]) {
+            Err(FillError::InvalidGoalPath { path }) => assert_eq!(path, spec),
+            Ok(_) => panic!("{spec:?} must be rejected"),
+            Err(other) => panic!("{spec:?}: unexpected error {other}"),
+        }
+    }
+}
+
+#[test]
+fn unknown_goal_field_is_an_error() {
+    match goal_profile_session().with_goal_fields(["nope"]) {
+        Err(FillError::UnknownGoalField { path }) => assert_eq!(path, "nope"),
+        Ok(_) => panic!("unknown field must be rejected"),
+        Err(other) => panic!("unexpected error {other}"),
+    }
+    match FillSession::<Vec<GoalRow>>::new("行を埋めて")
+        .expect("session")
+        .with_goal_fields(["[].nope"])
+    {
+        Err(FillError::UnknownGoalField { path }) => assert_eq!(path, "[].nope"),
+        Ok(_) => panic!("unknown field must be rejected"),
+        Err(other) => panic!("unexpected error {other}"),
+    }
+    // 要素のフィールドを素の名前で指定しても、ルート種別が違うので InvalidGoalPath。
+    match FillSession::<Vec<GoalRow>>::new("行を埋めて")
+        .expect("session")
+        .with_goal_fields(["market_key"])
+    {
+        Err(FillError::InvalidGoalPath { path }) => assert_eq!(path, "market_key"),
+        Ok(_) => panic!("bare field in array mode must be rejected"),
+        Err(other) => panic!("unexpected error {other}"),
+    }
+}
+
+#[tokio::test]
+async fn update_fixes_appended_element_after_partial_commit() {
+    let mut session = goal_array_session(&["[].sales_share"]);
+    match session
+        .call("append", json!({"items": [{"market_key": "steel"}]}))
+        .await
+    {
+        SessionResult::Continue { content, .. } => {
+            assert!(content.contains("追加しました"), "{content}");
+            assert!(content.contains("- [0].sales_share"), "{content}");
+        }
+        SessionResult::Done { content } => panic!("goal must block done: {content}"),
+        SessionResult::Impossible { .. } => panic!("unexpected impossible"),
+    }
+    // ゴール未達でも append はコミットされている。
+    assert_eq!(session.snapshot(), &json!([{"market_key": "steel"}]));
+
+    match session
+        .call(
+            "update",
+            json!({"index": 0, "patch": {"sales_share": "30%"}}),
+        )
+        .await
+    {
+        SessionResult::Done { content } => assert!(content.contains("1件"), "{content}"),
+        SessionResult::Continue { content, .. } => panic!("update must finish: {content}"),
+        SessionResult::Impossible { .. } => panic!("unexpected impossible"),
+    }
+
+    let outcome = session.into_outcome().expect("outcome");
+    assert_eq!(outcome.value[0].sales_share.as_deref(), Some("30%"));
+    assert_eq!(outcome.save_calls, 2);
+}
+
+#[tokio::test]
+async fn goal_feedback_says_update_not_append() {
+    let mut session = goal_array_session(&["[].sales_share"]);
+    match session
+        .call(
+            "append",
+            json!({"items": [{"market_key": "a"}, {"market_key": "b"}]}),
+        )
+        .await
+    {
+        SessionResult::Continue { content, .. } => {
+            assert!(
+                content.contains("update で index 0 と 1 の patch に sales_share を入れてください"),
+                "{content}"
+            );
+            assert!(
+                content.contains("append すると要素が増えるので使わないでください"),
+                "{content}"
+            );
+        }
+        SessionResult::Done { content } => panic!("goal must block done: {content}"),
+        SessionResult::Impossible { .. } => panic!("unexpected impossible"),
+    }
+}
+
+#[tokio::test]
+async fn goal_feedback_uses_custom_tool_names() {
+    let names = ai_json_filler_core::ArrayToolNames {
+        append: "add_rows".to_string(),
+        update: "patch_row".to_string(),
+        remove: "drop_row".to_string(),
+    };
+    let mut session = goal_array_session(&["[].sales_share"]).with_array_tool_names(names);
+    match session
+        .call("add_rows", json!({"items": [{"market_key": "a"}]}))
+        .await
+    {
+        SessionResult::Continue { content, .. } => {
+            assert!(content.contains("patch_row で index 0"), "{content}");
+            assert!(content.contains("add_rows すると要素が増える"), "{content}");
+            assert!(!content.contains("update で"), "{content}");
+        }
+        SessionResult::Done { content } => panic!("goal must block done: {content}"),
+        SessionResult::Impossible { .. } => panic!("unexpected impossible"),
+    }
+}
+
+#[tokio::test]
+async fn progress_feedback_lists_missing_goals() {
+    let mut session = goal_array_session(&["[].sales_share"]);
+    assert!(matches!(
+        session
+            .call("append", json!({"items": [{"market_key": "a"}]}))
+            .await,
+        SessionResult::Continue { .. }
+    ));
+    // 検証は通るがゴール未達の状態で、ツール無し応答への差し戻し。
+    assert!(session.snapshot().as_array().is_some());
+    let feedback = session.progress_feedback();
+    assert!(
+        feedback.contains("JSONはまだ完成していません"),
+        "{feedback}"
+    );
+    assert!(feedback.contains("[0].sales_share"), "{feedback}");
+    assert!(feedback.contains("update で index 0"), "{feedback}");
+    assert!(feedback.contains("append すると要素が増える"), "{feedback}");
+}
+
+#[tokio::test]
+async fn goal_feedback_limits_missing_lines() {
+    let mut session = goal_array_session(&["[].sales_share"]);
+    let items: Vec<Value> = (0..7)
+        .map(|index| json!({"market_key": format!("k{index}")}))
+        .collect();
+    match session.call("append", json!({"items": items})).await {
+        SessionResult::Continue { content, .. } => {
+            assert!(content.contains("- [4].sales_share"), "{content}");
+            assert!(!content.contains("- [5].sales_share"), "{content}");
+            assert!(content.contains("…他 2 件"), "{content}");
+            assert!(
+                content.contains("update で不足している要素の patch に値を入れてください"),
+                "{content}"
+            );
+            assert!(
+                content.contains("append すると要素が増えるので使わないでください"),
+                "{content}"
+            );
+        }
+        SessionResult::Done { content } => panic!("goal must block done: {content}"),
+        SessionResult::Impossible { .. } => panic!("unexpected impossible"),
+    }
 }

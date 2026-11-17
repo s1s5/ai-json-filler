@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use ai_json_filler_core::{
-    ArrayToolNames, BoxFuture, FillError, FillOutcome, FillSession, SessionResult, Tool,
+    ArrayToolNames, BoxFuture, FillError, FillOutcome, FillSession, GoalEmpty, SessionResult, Tool,
     ToolOutput, ToolSpec,
 };
 use genai::chat::{ChatMessage, ChatRequest, ContentPart, MessageContent, ToolResponse};
@@ -54,6 +54,8 @@ where
         save_tool_name: None,
         give_up_tool_name: None,
         array_tool_names: None,
+        goal_fields: Vec::new(),
+        goal_empty: None,
         max_turns: 3,
         max_rounds: 10,
         _marker: PhantomData,
@@ -73,6 +75,8 @@ pub struct GenaiFillBuilder<T> {
     save_tool_name: Option<String>,
     give_up_tool_name: Option<String>,
     array_tool_names: Option<ArrayToolNames>,
+    goal_fields: Vec<String>,
+    goal_empty: Option<GoalEmpty>,
     max_turns: usize,
     max_rounds: usize,
     _marker: PhantomData<fn() -> T>,
@@ -154,6 +158,25 @@ where
         self
     }
 
+    /// Require these fields to be filled before the session completes.
+    ///
+    /// Each entry is `field` (object mode) or `[].field` (array mode). Names are
+    /// validated against the schema when the session is created.
+    pub fn goal_fields<I, S>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.goal_fields = fields.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Policy for arrays with zero elements (default: [`GoalEmpty::Pass`]).
+    pub fn goal_empty(mut self, policy: GoalEmpty) -> Self {
+        self.goal_empty = Some(policy);
+        self
+    }
+
     pub async fn run(self) -> Result<FillOutcome<T>, FillError> {
         let max_turns = self.max_turns.max(1);
         let max_rounds = self.max_rounds.max(1);
@@ -170,6 +193,12 @@ where
         }
         if let Some(names) = self.array_tool_names {
             session = session.with_array_tool_names(names);
+        }
+        if !self.goal_fields.is_empty() {
+            session = session.with_goal_fields(self.goal_fields)?;
+        }
+        if let Some(policy) = self.goal_empty {
+            session = session.with_goal_empty(policy);
         }
         for tool in self.tools {
             session.add_tool(tool);
