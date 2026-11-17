@@ -870,3 +870,19 @@ async fn forced_save_blocks_removed_tool_execution() {
     }
     assert!(text.contains("現在利用できません"), "{text}");
 }
+
+#[tokio::test]
+async fn builder_forwards_prompt_version() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "save_result",
+        json!({"name": "x", "employees": 1}),
+    )])]));
+
+    let outcome = fill_with_backend::<Company>(backend, "調べて")
+        .prompt_version("stock-3")
+        .run()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.prompt_version, "save-contract-v3+stock-3");
+}

@@ -5,7 +5,7 @@
 //! - 小型モデルでも次の行動が決まる日本語にする
 //! - 余計キーを累積から除去して「一度送ると二度と消せない」デッドロックを断つ
 //!
-//! [`format_validation_feedback`] / [`strip_extra_keys`] は純関数。
+//! `format_validation_feedback` / `strip_extra_keys` は純関数。
 //! 呼び出し側（`runner`）は累積の clone を候補として渡し、成功したときだけ
 //! 累積へコミットする。`ValidationError` は候補を借用するため、
 //! 除去は「所有型へ抜き出す → 借用を切る → 書き換える」の順で行う。

@@ -20,6 +20,10 @@ use crate::{
     ToolSpec,
 };
 
+/// プロンプト構成の版。`SAVE_DESCRIPTION`・ガイド見出し・
+/// ゴール案内・予算メッセージを変えたら手で上げる。
+pub const PROMPT_VERSION: &str = "save-contract-v3";
+
 pub enum SessionResult {
     Continue {
         content: String,
@@ -58,6 +62,8 @@ pub struct FillOutcome<T> {
     /// 数え方は `tool_calls` と同じで、give_up の足切りに使う総数の
     /// 内訳になる。ツール予算の効果測定用。
     pub tool_calls_by_name: BTreeMap<String, usize>,
+    /// この結果を生成したプロンプトの版（例: `"save-contract-v3+stock-3"`）
+    pub prompt_version: String,
 }
 
 pub struct FillSession<T> {
@@ -80,6 +86,7 @@ pub struct FillSession<T> {
     goal_empty: GoalEmpty,
     warnings: Vec<String>,
     save_calls: usize,
+    prompt_version: String,
     done: bool,
     schema_guide: bool,
     guide_options: GuideOptions,
@@ -132,6 +139,7 @@ where
             goal_empty: GoalEmpty::default(),
             warnings: Vec::new(),
             save_calls: 0,
+            prompt_version: PROMPT_VERSION.to_string(),
             done: false,
             schema_guide: true,
             guide_options: GuideOptions::default(),
@@ -211,6 +219,22 @@ where
 
     pub fn guide_options(&self) -> &GuideOptions {
         &self.guide_options
+    }
+
+    /// 呼び出し側の版を連結する（例: `"stock-3"` →
+    /// `"save-contract-v3+stock-3"`）。空文字・空白のみは無視する。
+    pub fn with_prompt_version(mut self, suffix: impl Into<String>) -> Self {
+        let suffix = suffix.into();
+        let trimmed = suffix.trim();
+        if !trimmed.is_empty() {
+            self.prompt_version = format!("{}+{trimmed}", self.prompt_version);
+        }
+        self
+    }
+
+    /// このセッションが記録するプロンプト版。既定は [`PROMPT_VERSION`]。
+    pub fn prompt_version(&self) -> &str {
+        &self.prompt_version
     }
 
     /// Override the name of the tool used for partial saves.
@@ -827,6 +851,7 @@ where
                 warnings: self.warnings,
                 save_calls: self.save_calls,
                 tool_calls_by_name: self.tool_calls_by_name,
+                prompt_version: self.prompt_version,
             });
         }
         if let Some(give_up) = self.give_up {

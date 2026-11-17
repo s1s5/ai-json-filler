@@ -721,6 +721,10 @@ fn display_path_for_schema(path: &str) -> String {
     }
 }
 
+/// `full` から `required` を取り除いたスキーマを返す。
+///
+/// 差分は `required` の削除だけであり、`additionalProperties` /
+/// `unevaluatedProperties` / 型 / `enum` は変更しない。
 pub(crate) fn to_partial_schema(output_schema: &Value) -> Value {
     let mut schema = output_schema.clone();
     partial_recursive(&mut schema);
@@ -755,13 +759,6 @@ fn partial_recursive(schema: &mut Value) {
                 partial_recursive(branch);
             }
         }
-    }
-
-    if !matches!(obj.get("additionalProperties"), Some(v) if !v.is_boolean()) {
-        obj.insert("additionalProperties".to_string(), Value::Bool(true));
-    }
-    if !matches!(obj.get("unevaluatedProperties"), Some(v) if !v.is_boolean()) {
-        obj.insert("unevaluatedProperties".to_string(), Value::Bool(true));
     }
 }
 
@@ -971,6 +968,149 @@ mod tests {
         let partial = to_partial_schema(&schema);
         let inner = partial["$defs"]["Inner"].as_object().unwrap();
         assert!(inner.get("required").is_none());
+    }
+
+    #[test]
+    fn partial_keeps_closed_objects() {
+        let schema = FillSchema::for_type::<GuideCompany>().expect("schema");
+        assert_eq!(schema.full()["additionalProperties"], json!(false));
+        assert_eq!(schema.partial()["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    fn partial_keeps_closed_defs() {
+        let schema = FillSchema::for_type::<Vec<GuideRow>>().expect("schema");
+        assert_eq!(
+            schema.partial()["$defs"]["GuideRow"]["additionalProperties"],
+            json!(false)
+        );
+    }
+
+    /// Walk `full` and `partial` together and assert that the only difference
+    /// is the absence of `required` in `partial`.
+    fn assert_same_except_required(full: &Value, partial: &Value, path: &str) {
+        match (full, partial) {
+            (Value::Object(full_obj), Value::Object(partial_obj)) => {
+                assert!(
+                    partial_obj.get("required").is_none(),
+                    "required remains at {path}"
+                );
+                for (key, full_value) in full_obj {
+                    if key == "required" {
+                        continue;
+                    }
+                    let partial_value = partial_obj
+                        .get(key)
+                        .unwrap_or_else(|| panic!("{path}.{key} is missing from partial"));
+                    assert_same_except_required(
+                        full_value,
+                        partial_value,
+                        &format!("{path}.{key}"),
+                    );
+                }
+                for key in partial_obj.keys() {
+                    assert!(
+                        full_obj.contains_key(key),
+                        "{path}.{key} exists only in partial"
+                    );
+                }
+            }
+            (Value::Array(full_items), Value::Array(partial_items)) => {
+                assert_eq!(
+                    full_items.len(),
+                    partial_items.len(),
+                    "length differs at {path}"
+                );
+                for (index, (full_item, partial_item)) in
+                    full_items.iter().zip(partial_items.iter()).enumerate()
+                {
+                    assert_same_except_required(
+                        full_item,
+                        partial_item,
+                        &format!("{path}[{index}]"),
+                    );
+                }
+            }
+            _ => assert_eq!(full, partial, "value differs at {path}"),
+        }
+    }
+
+    #[test]
+    fn partial_is_full_minus_required() {
+        let object = FillSchema::for_type::<GuideCompany>().expect("schema");
+        assert_same_except_required(object.full(), object.partial(), "(root)");
+
+        let array = FillSchema::for_type::<Vec<GuideRow>>().expect("schema");
+        assert_same_except_required(array.full(), array.partial(), "(root)");
+
+        let caller = FillSchema::from_value(json!({
+            "type": "object",
+            "properties": {
+                "status": { "type": "string", "enum": ["active", "closed"] }
+            },
+            "required": ["status"],
+            "additionalProperties": false
+        }))
+        .expect("schema");
+        assert_same_except_required(caller.full(), caller.partial(), "(root)");
+    }
+
+    fn find_key(value: &Value, needle: &str, path: &str) -> Option<String> {
+        match value {
+            Value::Object(obj) => {
+                if obj.contains_key(needle) {
+                    return Some(path.to_string());
+                }
+                obj.iter()
+                    .find_map(|(key, child)| find_key(child, needle, &format!("{path}.{key}")))
+            }
+            Value::Array(items) => items
+                .iter()
+                .enumerate()
+                .find_map(|(index, child)| find_key(child, needle, &format!("{path}[{index}]"))),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn partial_has_no_unevaluated_properties() {
+        let object = FillSchema::for_type::<GuideCompany>().expect("schema");
+        let array = FillSchema::for_type::<Vec<GuideRow>>().expect("schema");
+        let wrapper = to_partial_schema(&wrapper_schema());
+        let caller = FillSchema::from_value(json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" } }
+        }))
+        .expect("schema");
+
+        for (label, schema) in [
+            ("object", object.partial()),
+            ("array", array.partial()),
+            ("wrapper", &wrapper),
+            ("caller", caller.partial()),
+        ] {
+            assert_eq!(
+                find_key(schema, "unevaluatedProperties", label),
+                None,
+                "unevaluatedProperties found in {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_value_preserves_caller_schema() {
+        let schema = FillSchema::from_value(json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" } }
+        }))
+        .expect("schema");
+        assert!(schema.partial().get("additionalProperties").is_none());
+        assert!(schema.partial().get("unevaluatedProperties").is_none());
+        assert!(
+            schema.partial()["properties"]["name"]
+                .get("additionalProperties")
+                .is_none()
+        );
     }
 
     #[test]

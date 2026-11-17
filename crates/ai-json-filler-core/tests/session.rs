@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ai_json_filler_core::{
     BoxFuture, ExtraKeys, FeedbackOptions, FillError, FillSession, GoalEmpty, GuideOptions,
-    SessionResult, Tool, ToolOutput, ToolSpec,
+    PROMPT_VERSION, SessionResult, Tool, ToolOutput, ToolSpec,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -621,6 +621,33 @@ async fn array_tool_specs_include_defs_for_ref_items() {
     let update = specs.iter().find(|spec| spec.name == "update").unwrap();
     assert!(append.parameters.get("$defs").is_some());
     assert!(update.parameters.get("$defs").is_some());
+}
+
+#[tokio::test]
+async fn tool_spec_is_closed() {
+    let session = new_session();
+    let specs = session.tool_specs();
+    let save = specs
+        .iter()
+        .find(|spec| spec.name == "save_result")
+        .expect("save_result spec");
+    assert_eq!(save.parameters["additionalProperties"], json!(false));
+    assert!(save.parameters.get("unevaluatedProperties").is_none());
+}
+
+#[tokio::test]
+async fn array_append_params_are_closed() {
+    let session = array_session();
+    let specs = session.tool_specs();
+    let append = specs.iter().find(|spec| spec.name == "append").unwrap();
+
+    let item = &append.parameters["properties"]["items"]["items"];
+    assert_eq!(item["$ref"], json!("#/$defs/Row"));
+    assert_eq!(
+        append.parameters["$defs"]["Row"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(append.parameters["additionalProperties"], json!(false));
 }
 
 #[tokio::test]
@@ -1615,4 +1642,55 @@ async fn outcome_reports_tool_calls_by_name() {
         BTreeMap::from([("fetch".to_string(), 1), ("lookup".to_string(), 2)])
     );
     assert_eq!(outcome.save_calls, 1);
+}
+
+#[tokio::test]
+async fn outcome_reports_default_prompt_version() {
+    let mut session = new_session();
+    assert_eq!(session.prompt_version(), PROMPT_VERSION);
+    assert!(!session.prompt_version().is_empty());
+
+    assert!(matches!(
+        session
+            .call(
+                "save_result",
+                json!({"name": "トヨタ", "employees": 370000})
+            )
+            .await,
+        SessionResult::Done { .. }
+    ));
+
+    let outcome = session.into_outcome().expect("outcome");
+    assert_eq!(outcome.prompt_version, PROMPT_VERSION);
+}
+
+#[tokio::test]
+async fn prompt_version_suffix_is_appended() {
+    let mut session = new_session().with_prompt_version("stock-3");
+    assert_eq!(session.prompt_version(), "save-contract-v3+stock-3");
+
+    assert!(matches!(
+        session
+            .call(
+                "save_result",
+                json!({"name": "トヨタ", "employees": 370000})
+            )
+            .await,
+        SessionResult::Done { .. }
+    ));
+
+    let outcome = session.into_outcome().expect("outcome");
+    assert_eq!(outcome.prompt_version, "save-contract-v3+stock-3");
+}
+
+#[tokio::test]
+async fn blank_prompt_version_suffix_is_ignored() {
+    for suffix in ["", "   ", "\t\n"] {
+        let session = new_session().with_prompt_version(suffix);
+        assert_eq!(
+            session.prompt_version(),
+            PROMPT_VERSION,
+            "suffix {suffix:?} must be ignored"
+        );
+    }
 }

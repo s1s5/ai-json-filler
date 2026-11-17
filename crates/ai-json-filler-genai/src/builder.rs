@@ -60,6 +60,7 @@ where
         schema_guide: None,
         guide_options: None,
         tool_budgets: Vec::new(),
+        prompt_version: None,
         force_save_after: None,
         max_turns: 3,
         max_rounds: 10,
@@ -86,6 +87,7 @@ pub struct GenaiFillBuilder<T> {
     schema_guide: Option<bool>,
     guide_options: Option<GuideOptions>,
     tool_budgets: Vec<(String, usize)>,
+    prompt_version: Option<String>,
     force_save_after: Option<usize>,
     max_turns: usize,
     max_rounds: usize,
@@ -213,6 +215,15 @@ where
         self
     }
 
+    /// 呼び出し側のプロンプト版を連結する（例: `"stock-3"` →
+    /// `"save-contract-v3+stock-3"`）。空文字・空白のみは無視される。
+    ///
+    /// 連結結果は [`FillOutcome::prompt_version`] から読める。
+    pub fn prompt_version(mut self, suffix: impl Into<String>) -> Self {
+        self.prompt_version = Some(suffix.into());
+        self
+    }
+
     /// Stop allowing investigation once `rounds` tool-call rounds have passed.
     ///
     /// From that round on, the request advertises only the save tools and
@@ -259,6 +270,9 @@ where
         }
         for (tool, max) in self.tool_budgets {
             session = session.with_tool_budget(tool, max);
+        }
+        if let Some(suffix) = self.prompt_version {
+            session = session.with_prompt_version(suffix);
         }
         for tool in self.tools {
             session.add_tool(tool);

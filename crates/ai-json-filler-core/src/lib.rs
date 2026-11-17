@@ -16,7 +16,7 @@ pub use feedback::FeedbackOptions;
 pub use give_up::{DEFAULT_GIVE_UP_TOOL_NAME, GiveUp};
 pub use goal::{GoalEmpty, GoalPath};
 pub use schema::{FillSchema, GuideOptions, RootKind};
-pub use session::{ExtraKeys, FillOutcome, FillSession, SessionResult};
+pub use session::{ExtraKeys, FillOutcome, FillSession, PROMPT_VERSION, SessionResult};
 pub use tool::{Tool, ToolOutput, ToolSet, ToolSpec};
 pub use typed_tool::{TypedTool, typed_tool};
 pub use validation::ValidationIssue;

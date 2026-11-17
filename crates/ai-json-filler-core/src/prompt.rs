@@ -1,8 +1,9 @@
 use crate::{ArrayToolNames, RootKind, ToolSet};
 
-pub(crate) const SAVE_DESCRIPTION: &str = "調査結果を部分的に保存する。渡したフィールドのみが既存データにマージされる。\
-     必須フィールドが全て揃うと自動的に検証が成功する。\
-     検証エラーが返った場合は、その不足フィールドを調査して再度呼び出せ。";
+pub(crate) const SAVE_DESCRIPTION: &str = "調査結果を JSON で保存する。引数は 1 つのオブジェクトで、\
+     分かった項目だけを入れてよい（オブジェクトはキー単位で統合、配列は全体を置き換える）。\
+     キーに `.` や `[0]` を付けず、入れ子は JSON の入れ子で書く。\
+     検証エラーが返ったら、指摘されたキーを直して再送する。";
 
 pub(crate) const LANGUAGE_RULES: &str = "【言語】\n\
      - 出力は必ず日本語で書くこと\n\
@@ -168,5 +169,39 @@ mod tests {
     fn guide_section_is_empty_when_fields_empty() {
         assert!(guide_section(RootKind::Object, "save_result", &default_names(), "").is_empty());
         assert!(guide_section(RootKind::Array, "save_result", &default_names(), "").is_empty());
+    }
+
+    #[test]
+    fn save_description_forbids_path_keys() {
+        assert!(
+            SAVE_DESCRIPTION.contains("キーに `.` や `[0]` を付けず"),
+            "{SAVE_DESCRIPTION}"
+        );
+    }
+
+    #[test]
+    fn save_description_mentions_array_replacement() {
+        assert!(
+            SAVE_DESCRIPTION.contains("配列は全体を置き換える"),
+            "{SAVE_DESCRIPTION}"
+        );
+    }
+
+    #[test]
+    fn save_description_has_no_merge_wording() {
+        assert!(!SAVE_DESCRIPTION.contains("マージ"), "{SAVE_DESCRIPTION}");
+        assert!(
+            !SAVE_DESCRIPTION.contains("部分的に保存"),
+            "{SAVE_DESCRIPTION}"
+        );
+    }
+
+    #[test]
+    fn save_description_keeps_retry_hint() {
+        assert!(
+            SAVE_DESCRIPTION.contains("検証エラーが返ったら"),
+            "{SAVE_DESCRIPTION}"
+        );
+        assert!(SAVE_DESCRIPTION.contains("再送"), "{SAVE_DESCRIPTION}");
     }
 }

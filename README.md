@@ -315,6 +315,24 @@ match fill::<CompanyProfile>(&client, "qwen3:8b", "調べて").run().await {
 }
 ```
 
+## プロンプト版（`prompt_version`）
+
+どのプロンプト構成で生成した結果かを `FillOutcome::prompt_version` に残す。DB の列にそのまま入れられる。
+
+- 既定値は `ai_json_filler_core::PROMPT_VERSION`（現在 `"save-contract-v3"`）。呼び出し側の版はサフィックスとして連結される。
+- core は `FillSession::with_prompt_version("stock-3")`、genai は `.prompt_version("stock-3")` で指定する。空文字・空白のみは無視され、既定のままになる。
+- 結果は `"save-contract-v3+stock-3"` の形。`FillSession::prompt_version()` でセッション側からも読める。
+
+```rust
+let outcome = fill::<CompanyProfile>(&client, "qwen3:8b", "調べて")
+    .prompt_version("stock-3")
+    .run()
+    .await?;
+// outcome.prompt_version == "save-contract-v3+stock-3"
+```
+
+**版を上げる規律**: `SAVE_DESCRIPTION`・`LANGUAGE_RULES`・`guide_section` の見出し・`goal_feedback` の文面・`budget_message` を変えたら `PROMPT_VERSION` を上げる。テンプレートがスキーマ・ツール名・タスク文で動的なためハッシュでは検出できない。上げ忘れは PR のチェック項目で防ぐ。
+
 ## 設計上の注意
 
 - **保存ツール名**: 既定は `save_result`（`ai_json_filler_core::DEFAULT_SAVE_TOOL_NAME`）。core は `FillSession::with_save_tool_name("store_fields")`、genai は `.save_tool_name("store_fields")` で変更できる。空文字・空白のみの名前は無視され、既定のままになる。
