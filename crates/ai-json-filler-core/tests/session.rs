@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ai_json_filler_core::{
     BoxFuture, ExtraKeys, FeedbackOptions, FillError, FillSession, GoalEmpty, GuideOptions,
@@ -1326,4 +1328,291 @@ async fn goal_feedback_limits_missing_lines() {
         SessionResult::Done { content } => panic!("goal must block done: {content}"),
         SessionResult::Impossible { .. } => panic!("unexpected impossible"),
     }
+}
+
+// --- 修正 07: ツール予算（with_tool_budget） ---
+
+struct CountingTool {
+    name: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+
+impl CountingTool {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn shared(name: &'static str, calls: &Arc<AtomicUsize>) -> Self {
+        Self {
+            name,
+            calls: Arc::clone(calls),
+        }
+    }
+}
+
+impl Tool for CountingTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.to_string(),
+            description: "呼び出し回数を数えるダミー".to_string(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn call<'a>(&'a self, _args: Value) -> BoxFuture<'a, Result<ToolOutput, FillError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput::success("調査しました"))
+        })
+    }
+}
+
+#[tokio::test]
+async fn budget_blocks_sixth_call() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut session = new_session().with_tool_budget("lookup", 5);
+    session.add_tool(Arc::new(CountingTool::shared("lookup", &calls)));
+
+    for _ in 0..5 {
+        match session.call("lookup", json!({})).await {
+            SessionResult::Continue { content, is_error } => {
+                assert!(!is_error, "{content}");
+                assert!(content.contains("調査しました"), "{content}");
+            }
+            _ => panic!("expected continue"),
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+
+    // 上限到達後は実行しない。
+    match session.call("lookup", json!({})).await {
+        SessionResult::Continue { content, is_error } => {
+            assert!(!is_error, "{content}");
+            assert!(content.contains("上限（5 回）"), "{content}");
+            assert!(!content.contains("調査しました"), "{content}");
+        }
+        _ => panic!("budget must block the sixth call"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+}
+
+#[tokio::test]
+async fn budget_message_names_save_tool() {
+    let mut session = new_session().with_tool_budget("lookup", 1);
+    session.add_tool(Arc::new(CountingTool::new("lookup")));
+
+    assert!(matches!(
+        session.call("lookup", json!({})).await,
+        SessionResult::Continue { .. }
+    ));
+    match session.call("lookup", json!({})).await {
+        SessionResult::Continue { content, is_error } => {
+            assert!(!is_error, "{content}");
+            assert!(!content.contains("append"), "{content}");
+            assert_eq!(
+                content,
+                "lookup は上限（1 回）に達しました。これ以上呼ばず、分かった範囲で save_result を呼び出して保存してください。"
+            );
+        }
+        _ => panic!("budget must block"),
+    }
+}
+
+#[tokio::test]
+async fn budget_message_names_array_tools() {
+    let mut session = array_session().with_tool_budget("lookup", 1);
+    session.add_tool(Arc::new(CountingTool::new("lookup")));
+
+    assert!(matches!(
+        session.call("lookup", json!({})).await,
+        SessionResult::Continue { .. }
+    ));
+    match session.call("lookup", json!({})).await {
+        SessionResult::Continue { content, is_error } => {
+            assert!(!is_error, "{content}");
+            assert!(!content.contains("save_result"), "{content}");
+            assert_eq!(
+                content,
+                "lookup は上限（1 回）に達しました。これ以上呼ばず、分かった範囲で append / update / remove のいずれかで保存してください。"
+            );
+        }
+        _ => panic!("budget must block"),
+    }
+
+    // カスタム名でも案内は設定値から取る。
+    let names = ai_json_filler_core::ArrayToolNames {
+        append: "add_rows".to_string(),
+        update: "patch_row".to_string(),
+        remove: "drop_row".to_string(),
+    };
+    let mut custom = array_session()
+        .with_array_tool_names(names)
+        .with_tool_budget("lookup", 1);
+    custom.add_tool(Arc::new(CountingTool::new("lookup")));
+    assert!(matches!(
+        custom.call("lookup", json!({})).await,
+        SessionResult::Continue { .. }
+    ));
+    match custom.call("lookup", json!({})).await {
+        SessionResult::Continue { content, .. } => {
+            assert!(
+                content.contains("add_rows / patch_row / drop_row のいずれかで"),
+                "{content}"
+            );
+            assert!(!content.contains(" append "), "{content}");
+        }
+        _ => panic!("budget must block"),
+    }
+}
+
+#[tokio::test]
+async fn budget_zero_is_noop() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut session = new_session().with_tool_budget("lookup", 0);
+    assert!(
+        session.tool_budgets().is_empty(),
+        "{:?}",
+        session.tool_budgets()
+    );
+    session.add_tool(Arc::new(CountingTool::shared("lookup", &calls)));
+
+    for _ in 0..12 {
+        match session.call("lookup", json!({})).await {
+            SessionResult::Continue { content, is_error } => {
+                assert!(!is_error, "{content}");
+                assert!(content.contains("調査しました"), "{content}");
+            }
+            _ => panic!("expected continue"),
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 12);
+
+    // 既に設定済みの上限を 0 で解除できる。
+    let session = new_session().with_tool_budget("lookup", 3);
+    assert_eq!(session.tool_budgets().get("lookup"), Some(&3));
+    let session = session.with_tool_budget("lookup", 0);
+    assert!(
+        session.tool_budgets().is_empty(),
+        "{:?}",
+        session.tool_budgets()
+    );
+}
+
+#[tokio::test]
+async fn budget_does_not_block_save() {
+    // Object モード: save_result に予算を張っても保存は止まらない。
+    let mut session = new_session().with_tool_budget("save_result", 1);
+    assert!(matches!(
+        session.call("save_result", json!({"name": "トヨタ"})).await,
+        SessionResult::Continue { .. }
+    ));
+    match session
+        .call("save_result", json!({"employees": 370000}))
+        .await
+    {
+        SessionResult::Done { content } => assert!(content.contains("保存しました"), "{content}"),
+        SessionResult::Continue { content, .. } => panic!("save must not be blocked: {content}"),
+        _ => panic!("unexpected result"),
+    }
+
+    // Array モード: append / update / remove も同様。
+    let mut array = array_session().with_tool_budget("append", 1);
+    assert!(matches!(
+        array
+            .call("append", json!({"items": [{"name": "A"}]}))
+            .await,
+        SessionResult::Continue { .. }
+    ));
+    match array
+        .call("append", json!({"items": [{"name": "B"}]}))
+        .await
+    {
+        SessionResult::Continue { content, is_error } => {
+            assert!(!is_error, "{content}");
+            assert!(content.contains("追加しました"), "{content}");
+        }
+        _ => panic!("append must not be blocked"),
+    }
+    assert_eq!(array.snapshot(), &json!([{"name": "A"}, {"name": "B"}]));
+}
+
+#[tokio::test]
+async fn budget_counts_by_name() {
+    let lookup = Arc::new(AtomicUsize::new(0));
+    let fetch = Arc::new(AtomicUsize::new(0));
+    let mut session = new_session()
+        .with_tool_budget("lookup", 2)
+        .with_tool_budget("fetch", 1);
+    session.add_tool(Arc::new(CountingTool::shared("lookup", &lookup)));
+    session.add_tool(Arc::new(CountingTool::shared("fetch", &fetch)));
+
+    for _ in 0..2 {
+        assert!(matches!(
+            session.call("lookup", json!({})).await,
+            SessionResult::Continue { .. }
+        ));
+    }
+    match session.call("lookup", json!({})).await {
+        SessionResult::Continue { content, .. } => {
+            assert!(content.contains("上限（2 回）"), "{content}");
+        }
+        _ => panic!("lookup budget must block"),
+    }
+
+    // fetch は独立に数える（lookup の消費に影響されない）。
+    assert!(matches!(
+        session.call("fetch", json!({})).await,
+        SessionResult::Continue { .. }
+    ));
+    match session.call("fetch", json!({})).await {
+        SessionResult::Continue { content, .. } => {
+            assert!(content.contains("上限（1 回）"), "{content}");
+        }
+        _ => panic!("fetch budget must block"),
+    }
+
+    assert_eq!(lookup.load(Ordering::SeqCst), 2);
+    assert_eq!(fetch.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn outcome_reports_tool_calls_by_name() {
+    let lookup = Arc::new(AtomicUsize::new(0));
+    let fetch = Arc::new(AtomicUsize::new(0));
+    let mut session = new_session().with_tool_budget("fetch", 1);
+    session.add_tool(Arc::new(CountingTool::shared("lookup", &lookup)));
+    session.add_tool(Arc::new(CountingTool::shared("fetch", &fetch)));
+
+    for _ in 0..2 {
+        assert!(matches!(
+            session.call("lookup", json!({})).await,
+            SessionResult::Continue { .. }
+        ));
+    }
+    // 2 回目はブロックされるので内訳に入らない。
+    for _ in 0..2 {
+        assert!(matches!(
+            session.call("fetch", json!({})).await,
+            SessionResult::Continue { .. }
+        ));
+    }
+    assert!(matches!(
+        session
+            .call(
+                "save_result",
+                json!({"name": "トヨタ", "employees": 370000})
+            )
+            .await,
+        SessionResult::Done { .. }
+    ));
+
+    let outcome = session.into_outcome().expect("outcome");
+    assert_eq!(
+        outcome.tool_calls_by_name,
+        BTreeMap::from([("fetch".to_string(), 1), ("lookup".to_string(), 2)])
+    );
+    assert_eq!(outcome.save_calls, 1);
 }

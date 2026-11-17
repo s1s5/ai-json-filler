@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -6,8 +7,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::feedback::{
-    FeedbackOptions, empty_args_feedback, extra_key_path, format_validation_feedback,
-    goal_feedback, goal_section, rejected_extra_keys_feedback,
+    FeedbackOptions, budget_message, empty_args_feedback, extra_key_path,
+    format_validation_feedback, goal_feedback, goal_section, rejected_extra_keys_feedback,
+    save_action,
 };
 use crate::give_up::{self, DEFAULT_GIVE_UP_TOOL_NAME, GiveUp};
 use crate::goal::{self, GoalEmpty, GoalPath, GoalReport};
@@ -45,11 +47,17 @@ pub enum ExtraKeys {
     Reject,
 }
 
+#[non_exhaustive]
 pub struct FillOutcome<T> {
     pub value: T,
     pub raw: Value,
     pub warnings: Vec<String>,
     pub save_calls: usize,
+    /// 実行した調査ツール呼び出しの内訳（保存系ツールとブロックされた呼び出しは含まない）
+    ///
+    /// 数え方は `tool_calls` と同じで、give_up の足切りに使う総数の
+    /// 内訳になる。ツール予算の効果測定用。
+    pub tool_calls_by_name: BTreeMap<String, usize>,
 }
 
 pub struct FillSession<T> {
@@ -63,6 +71,9 @@ pub struct FillSession<T> {
     give_up_tool_name: String,
     give_up_min_tool_calls: Option<usize>,
     tool_calls: usize,
+    tool_calls_by_name: BTreeMap<String, usize>,
+    tool_budgets: BTreeMap<String, usize>,
+    tool_allowlist: Option<Vec<String>>,
     feedback: FeedbackOptions,
     extra_keys: ExtraKeys,
     goal_fields: Vec<GoalPath>,
@@ -112,6 +123,9 @@ where
             give_up_tool_name: DEFAULT_GIVE_UP_TOOL_NAME.to_string(),
             give_up_min_tool_calls: None,
             tool_calls: 0,
+            tool_calls_by_name: BTreeMap::new(),
+            tool_budgets: BTreeMap::new(),
+            tool_allowlist: None,
             feedback: FeedbackOptions::default(),
             extra_keys: ExtraKeys::default(),
             goal_fields: Vec::new(),
@@ -281,6 +295,49 @@ where
         self
     }
 
+    /// Cap how many times `tool` may be executed. `0` means "no limit".
+    ///
+    /// The cap is checked before the tool runs: the call that would exceed it
+    /// is not executed (no token or network cost) and is answered with
+    /// [`SessionResult::Continue`] carrying `is_error: false`. Blocked calls do
+    /// not count toward the give-up gate.
+    ///
+    /// Saving is never capped: `save_result` / `append` / `update` / `remove`
+    /// and the give-up tool are dispatched before the budget is consulted, so a
+    /// budget set on their names has no effect. A budget on a name that is not
+    /// registered yet is kept and applies once the tool is added.
+    ///
+    /// `0` is a no-op rather than "block this tool": a misconfiguration should
+    /// not wedge the session. An empty name is ignored.
+    pub fn with_tool_budget(mut self, tool: impl Into<String>, max: usize) -> Self {
+        let tool = tool.into();
+        let trimmed = tool.trim();
+        if trimmed.is_empty() {
+            return self;
+        }
+        if max == 0 {
+            self.tool_budgets.remove(trimmed);
+            return self;
+        }
+        self.tool_budgets.insert(trimmed.to_string(), max);
+        self
+    }
+
+    /// The per-tool caps currently in effect.
+    pub fn tool_budgets(&self) -> &BTreeMap<String, usize> {
+        &self.tool_budgets
+    }
+
+    /// Restrict which investigation tools may run.
+    ///
+    /// `Some(names)` makes `call` refuse any other registered tool, so a model
+    /// that remembers a tool removed from the advertised list cannot keep
+    /// using it. `None` removes the restriction. Save and give-up tools are
+    /// never restricted.
+    pub fn set_tool_allowlist(&mut self, names: Option<Vec<String>>) {
+        self.tool_allowlist = names;
+    }
+
     pub fn add_tool(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
         self.tools.insert(tool);
         self
@@ -331,6 +388,28 @@ where
         specs
     }
 
+    /// Tool definitions that only save, plus the give-up tool.
+    ///
+    /// Object mode exposes [`Self::save_tool_name`]; Array mode exposes the
+    /// three array tools. Investigation tools registered with [`Self::add_tool`]
+    /// are not included. A loop can swap this in for [`Self::tool_specs`] once
+    /// it wants to stop the model from investigating further.
+    pub fn save_only_tool_specs(&self) -> Vec<ToolSpec> {
+        let mut specs = match self.schema.root_kind() {
+            RootKind::Object => vec![ToolSpec {
+                name: self.save_tool_name.clone(),
+                description: SAVE_DESCRIPTION.to_string(),
+                parameters: self.schema.partial().clone(),
+            }],
+            RootKind::Array => crate::array::specs(&self.schema, &self.array_tool_names),
+        };
+        let give_up_spec = give_up::spec(&self.give_up_tool_name);
+        if !specs.iter().any(|spec| spec.name == give_up_spec.name) {
+            specs.push(give_up_spec);
+        }
+        specs
+    }
+
     /// Whether the session reached a terminal state (saved or given up).
     pub fn is_done(&self) -> bool {
         self.done || self.give_up.is_some()
@@ -358,15 +437,11 @@ where
     /// Always states that the JSON is still incomplete and lists the current
     /// validation issues, so the model knows why it must call a mutation tool.
     pub fn progress_feedback(&self) -> String {
-        let action = match self.schema.root_kind() {
-            RootKind::Object => format!("{} を呼び出して", self.save_tool_name),
-            RootKind::Array => format!(
-                "{} / {} / {} のいずれかで",
-                self.array_tool_names.append,
-                self.array_tool_names.update,
-                self.array_tool_names.remove
-            ),
-        };
+        let action = save_action(
+            self.schema.root_kind(),
+            &self.save_tool_name,
+            &self.array_tool_names,
+        );
         match self.schema.validate(&self.accumulated) {
             Ok(()) => match self.unsatisfied_goals(&self.accumulated) {
                 Some(report) => {
@@ -440,13 +515,41 @@ where
         if name == self.give_up_tool_name {
             return self.give_up(args);
         }
+        if let Some(allowed) = &self.tool_allowlist
+            && !allowed.iter().any(|allowed_name| allowed_name == name)
+        {
+            return SessionResult::Continue {
+                content: format!(
+                    "TOOL_ERROR: ツール '{name}' は現在利用できません。保存してください。"
+                ),
+                is_error: true,
+            };
+        }
         if !self.tools.contains(name) {
             return SessionResult::Continue {
                 content: format!("TOOL_ERROR: ツール '{name}' は利用できません"),
                 is_error: true,
             };
         }
+        // 予算超過は「実行しない」で返す。トークンも時間も使わず、give_up の
+        // 足切り（ツール呼び出し総数）も進めない。
+        if let Some(max) = self.tool_budgets.get(name).copied() {
+            let used = self.tool_calls_by_name.get(name).copied().unwrap_or(0);
+            if used >= max {
+                return SessionResult::Continue {
+                    content: budget_message(
+                        name,
+                        max,
+                        self.schema.root_kind(),
+                        &self.save_tool_name,
+                        &self.array_tool_names,
+                    ),
+                    is_error: false,
+                };
+            }
+        }
         self.tool_calls += 1;
+        *self.tool_calls_by_name.entry(name.to_string()).or_insert(0) += 1;
         match self.tools.call(name, args).await {
             Ok(output) => SessionResult::Continue {
                 content: output.content,
@@ -723,6 +826,7 @@ where
                 raw: self.accumulated,
                 warnings: self.warnings,
                 save_calls: self.save_calls,
+                tool_calls_by_name: self.tool_calls_by_name,
             });
         }
         if let Some(give_up) = self.give_up {

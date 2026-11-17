@@ -175,6 +175,44 @@ let outcome = fill::<CompanyProfile>(&client, "qwen3:8b", "調べて")
 
 両方とも 1 未満は 1 に丸められる。
 
+## ツール予算（`with_tool_budget`）
+
+`web_search` などの調査ツールは、放っておくと調査が終わらずタイムアウトしやすい。ツール名ごとの実行回数に上限を置ける。
+
+```rust
+use ai_json_filler_core::FillSession;
+
+let session = FillSession::<CompanyProfile>::new("調べて")?
+    .with_tool_budget("web_search", 5);
+```
+
+- 上限に達した呼び出しは**実行しない**（トークンも時間も使わない）。`SessionResult::Continue { is_error: false }` で「上限（5 回）に達しました。… `save_result` を呼び出して保存してください」と案内する。案内の保存ツール名は設定値から取る（Array モードでは `append` / `update` / `remove`）。
+- ブロックした呼び出しは `tool_calls` にも数えない（`give_up` の足切りは進まない）。実行回数の内訳は `FillOutcome::tool_calls_by_name` で読める。これは調査ツールだけを数え、保存系ツールは含まない。
+- `max == 0` は「上限なし」（設定しないのと同じ）。誤設定でセッションが詰まない側に倒している。空のツール名は無視する。
+- `save_result` / `append` / `update` / `remove` / `give_up` は予算の対象外。保存と報告は止めない。
+- `Tool::prompt_hint()` の「合計5回まで」は助言にすぎない。実際の上限は `with_tool_budget` で決める。両方を同じ値にしておくのが望ましい。
+- ツール名は登録名と完全一致で照合する。未登録の名前への設定は保持され、登録後に効く。
+
+`with_tool_budget` は core の API。genai ビルダーには公開していない（`with_give_up_after_tool_calls` と同じ扱い）。
+
+## 保存の強制（`force_save_after`）
+
+調査が長引いて保存されずに終わるのを防ぐには、ラウンド数を閾値にして調査ツールを外す。
+
+```rust
+let outcome = fill::<CompanyProfile>(&client, "qwen3:8b", "調べて")
+    .force_save_after(2)
+    .run()
+    .await?;
+```
+
+- 閾値以降のラウンドでは `request.tools` を保存系だけに差し替える。Object モードは `save_result`、Array モードは `append` / `update` / `remove`。どちらも `give_up` は残す。
+- 閾値に達した最初のラウンドで、「これ以上は調査できません。…」という user メッセージを 1 回だけ差し込む。ターンが進んでラウンド数が 0 に戻っても再挿入しない。
+- `force_save_after(0)` は最初のリクエストから強制する。未設定（既定）なら従来どおり全ラウンドで同じツール一覧。
+- 強制中は `FillSession::set_tool_allowlist` により、一覧から外したツールの**実行も拒否**する（モデルが名前を覚えていて呼んできた場合に備える）。
+- 早すぎる閾値は情報不足のまま保存させる。`force_save_after(0)` では調査ツールが最初から使えないため、モデルは自分の知識で埋めることになる。
+- core から使う場合は `FillSession::save_only_tool_specs()` を `tool_specs()` の代わりに渡し、併せて `set_tool_allowlist(Some(names))` を設定する。
+
 ## core を他のフレームワークに組み込む
 
 ホストは次の 4 つだけを使う。

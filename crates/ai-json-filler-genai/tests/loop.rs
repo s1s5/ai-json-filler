@@ -527,3 +527,346 @@ async fn builder_rejects_unknown_goal_field() {
         ),
     }
 }
+
+struct CountingLookup {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ai_json_filler_core::Tool for CountingLookup {
+    fn spec(&self) -> ai_json_filler_core::ToolSpec {
+        ai_json_filler_core::ToolSpec {
+            name: "lookup".to_string(),
+            description: "調べる".to_string(),
+            parameters: json!({"type":"object","properties":{}}),
+        }
+    }
+
+    fn call<'a>(
+        &'a self,
+        _args: Value,
+    ) -> ai_json_filler_core::BoxFuture<'a, Result<ai_json_filler_core::ToolOutput, FillError>>
+    {
+        Box::pin(async move {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ai_json_filler_core::ToolOutput::success("調べました"))
+        })
+    }
+}
+
+#[tokio::test]
+async fn builder_forwards_tool_budget() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(ScriptedBackend::new(vec![
+        response(vec![tool_call("1", "lookup", json!({}))]),
+        response(vec![tool_call("2", "lookup", json!({}))]),
+        response(vec![tool_call(
+            "3",
+            "save_result",
+            json!({"name": "x", "employees": 1}),
+        )]),
+    ]));
+
+    let outcome = fill_with_backend::<Company>(backend.clone(), "調べて")
+        .tool(Arc::new(CountingLookup {
+            calls: calls.clone(),
+        }))
+        .tool_budget("lookup", 1)
+        .run()
+        .await;
+
+    assert!(outcome.is_ok(), "should complete");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "2回目は実行されない");
+    assert_eq!(outcome.unwrap().tool_calls_by_name.get("lookup"), Some(&1));
+    let requests = backend.requests();
+    let last = requests.last().unwrap();
+    let mut text = String::new();
+    for message in &last.messages {
+        for chunk in message.content.texts() {
+            text.push_str(chunk);
+            text.push('\n');
+        }
+        for response in message.content.tool_responses() {
+            text.push_str(&response.content);
+            text.push('\n');
+        }
+    }
+    assert!(text.contains("上限（1 回）"), "{text}");
+}
+
+#[tokio::test]
+async fn builder_forwards_extra_keys_strip() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "save_result",
+        json!({"name": "x", "employees": 1, "bogus": true}),
+    )])]));
+
+    let outcome = fill_with_backend::<Company>(backend, "調べて")
+        .extra_keys(ai_json_filler_core::ExtraKeys::Strip)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(outcome.raw, json!({"name": "x", "employees": 1}));
+    assert!(outcome.warnings.iter().any(|w| w.contains("bogus")));
+}
+
+#[tokio::test]
+async fn builder_can_disable_schema_guide() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "save_result",
+        json!({"name": "x", "employees": 1}),
+    )])]));
+    let _ = fill_with_backend::<Company>(backend.clone(), "調べて")
+        .schema_guide(false)
+        .run()
+        .await;
+    let system = backend.requests()[0].system.clone().unwrap_or_default();
+    assert!(!system.contains("保存する JSON の形"), "{system}");
+}
+
+fn tool_names(request: &ChatRequest) -> Vec<String> {
+    request
+        .tools
+        .as_ref()
+        .expect("request must carry tools")
+        .iter()
+        .map(|tool| tool.name.as_str().to_string())
+        .collect()
+}
+
+fn nudge_count(request: &ChatRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .filter(|message| {
+            message
+                .content
+                .texts()
+                .iter()
+                .any(|text| text.contains("これ以上は調査できません"))
+        })
+        .count()
+}
+
+fn lookup_tool() -> Tool {
+    Tool::new(ToolName::Custom("lookup".to_string()))
+        .with_description("調べる")
+        .with_schema(json!({"type": "object", "properties": {}}))
+}
+
+fn lookup_handler()
+-> impl Fn(Value) -> BoxFuture<'static, Result<ToolOutput, FillError>> + Send + Sync {
+    |_args: Value| Box::pin(async { Ok(ToolOutput::success("調べました")) })
+}
+
+#[tokio::test]
+async fn force_save_after_swaps_tools() {
+    let backend = Arc::new(ScriptedBackend::new(vec![
+        response(vec![tool_call("1", "lookup", json!({}))]),
+        response(vec![tool_call(
+            "2",
+            "save_result",
+            json!({"name": "x", "employees": 1}),
+        )]),
+    ]));
+
+    let outcome = fill_with_backend::<Company>(backend.clone(), "調べて")
+        .genai_tool(lookup_tool(), lookup_handler())
+        .force_save_after(1)
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.value.employees, 1);
+    let requests = backend.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        tool_names(&requests[0]).iter().any(|name| name == "lookup"),
+        "the first round must still advertise investigation tools"
+    );
+    assert!(
+        !tool_names(&requests[1]).iter().any(|name| name == "lookup"),
+        "forced rounds must not advertise investigation tools"
+    );
+}
+
+#[tokio::test]
+async fn force_save_after_keeps_save_tool() {
+    let backend = Arc::new(ScriptedBackend::new(vec![
+        response(vec![tool_call("1", "lookup", json!({}))]),
+        response(vec![tool_call(
+            "2",
+            "save_result",
+            json!({"name": "x", "employees": 1}),
+        )]),
+    ]));
+
+    fill_with_backend::<Company>(backend.clone(), "調べて")
+        .genai_tool(lookup_tool(), lookup_handler())
+        .force_save_after(1)
+        .run()
+        .await
+        .unwrap();
+
+    let forced = tool_names(&backend.requests()[1]);
+    assert!(
+        forced.iter().any(|name| name == "save_result"),
+        "{forced:?}"
+    );
+    assert!(forced.iter().any(|name| name == "give_up"), "{forced:?}");
+}
+
+#[tokio::test]
+async fn force_save_after_keeps_array_tools() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "append",
+        json!({"items": [{"name": "A", "note": "n"}]}),
+    )])]));
+
+    let outcome = fill_with_backend::<Vec<Row>>(backend.clone(), "調べて")
+        .genai_tool(lookup_tool(), lookup_handler())
+        .force_save_after(0)
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.value.len(), 1);
+    let names = tool_names(&backend.requests()[0]);
+    for expected in ["append", "update", "remove", "give_up"] {
+        assert!(
+            names.iter().any(|name| name == expected),
+            "missing {expected}: {names:?}"
+        );
+    }
+    assert!(!names.iter().any(|name| name == "lookup"), "{names:?}");
+}
+
+#[tokio::test]
+async fn force_save_after_adds_nudge_once() {
+    let backend = Arc::new(ScriptedBackend::new(vec![
+        response(vec![tool_call("1", "lookup", json!({}))]),
+        text_response("まだです"),
+        response(vec![tool_call(
+            "2",
+            "save_result",
+            json!({"name": "x", "employees": 1}),
+        )]),
+    ]));
+
+    fill_with_backend::<Company>(backend.clone(), "調べて")
+        .genai_tool(lookup_tool(), lookup_handler())
+        .force_save_after(1)
+        .max_turns(2)
+        .run()
+        .await
+        .unwrap();
+
+    let requests = backend.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(nudge_count(&requests[0]), 0);
+    assert_eq!(
+        nudge_count(&requests[1]),
+        1,
+        "the forced round must carry the nudge"
+    );
+    assert_eq!(
+        nudge_count(&requests[2]),
+        1,
+        "the nudge must not be inserted again after a turn reset"
+    );
+}
+
+#[tokio::test]
+async fn force_save_after_zero_means_immediate() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "save_result",
+        json!({"name": "x", "employees": 1}),
+    )])]));
+
+    fill_with_backend::<Company>(backend.clone(), "調べて")
+        .genai_tool(lookup_tool(), lookup_handler())
+        .force_save_after(0)
+        .run()
+        .await
+        .unwrap();
+
+    let request = &backend.requests()[0];
+    let names = tool_names(request);
+    assert!(!names.iter().any(|name| name == "lookup"), "{names:?}");
+    assert!(names.iter().any(|name| name == "save_result"), "{names:?}");
+    assert_eq!(nudge_count(request), 1);
+}
+
+#[tokio::test]
+async fn without_force_save_tools_are_stable() {
+    let backend = Arc::new(ScriptedBackend::new(vec![
+        response(vec![tool_call("1", "lookup", json!({}))]),
+        response(vec![tool_call("2", "lookup", json!({}))]),
+        response(vec![tool_call(
+            "3",
+            "save_result",
+            json!({"name": "x", "employees": 1}),
+        )]),
+    ]));
+
+    fill_with_backend::<Company>(backend.clone(), "調べて")
+        .genai_tool(lookup_tool(), lookup_handler())
+        .run()
+        .await
+        .unwrap();
+
+    let requests = backend.requests();
+    assert_eq!(requests.len(), 3);
+    let expected = tool_names(&requests[0]);
+    assert!(expected.iter().any(|name| name == "lookup"));
+    for request in &requests {
+        assert_eq!(tool_names(request), expected);
+        assert_eq!(nudge_count(request), 0);
+    }
+}
+
+#[tokio::test]
+async fn forced_save_blocks_removed_tool_execution() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(ScriptedBackend::new(vec![
+        response(vec![tool_call("1", "lookup", json!({}))]),
+        // 一覧から消えた後も、モデルが名前を覚えていて呼ぶケース
+        response(vec![tool_call("2", "lookup", json!({}))]),
+        response(vec![tool_call(
+            "3",
+            "save_result",
+            json!({"name": "x", "employees": 1}),
+        )]),
+    ]));
+
+    let outcome = fill_with_backend::<Company>(backend.clone(), "調べて")
+        .tool(Arc::new(CountingLookup {
+            calls: calls.clone(),
+        }))
+        .force_save_after(1)
+        .run()
+        .await;
+
+    assert!(outcome.is_ok(), "保存まで到達するはず");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "強制後は実行されない（一覧から消すだけでは不十分）"
+    );
+    let requests = backend.requests();
+    let mut text = String::new();
+    for message in &requests.last().unwrap().messages {
+        for response in message.content.tool_responses() {
+            text.push_str(&response.content);
+            text.push('\n');
+        }
+    }
+    assert!(text.contains("現在利用できません"), "{text}");
+}

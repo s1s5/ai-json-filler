@@ -22,6 +22,7 @@ use serde_json::Value;
 
 use crate::ArrayToolNames;
 use crate::FillSchema;
+use crate::RootKind;
 use crate::goal::{GoalMiss, GoalReport};
 use items::{
     Section, apply_budget, assemble, collect_extra, collect_missing, collect_value_errors,
@@ -33,6 +34,41 @@ pub(crate) use crate::schema::{collect_extra_keys, strip_extra_keys};
 
 /// ゴール不足の一覧に出す行数の上限
 const MAX_GOAL_LINES: usize = 5;
+
+/// 保存を促す句（`save_result を呼び出して` / `append / update / remove のいずれかで`）
+///
+/// ツール無し応答への差し戻しと、ツール予算に達したときの案内で共有する。
+/// ツール名は設定値から取るので、カスタム名でもそのまま通る。
+pub(crate) fn save_action(
+    root_kind: RootKind,
+    save_tool_name: &str,
+    names: &ArrayToolNames,
+) -> String {
+    match root_kind {
+        RootKind::Object => format!("{save_tool_name} を呼び出して"),
+        RootKind::Array => format!(
+            "{} / {} / {} のいずれかで",
+            names.append, names.update, names.remove
+        ),
+    }
+}
+
+/// ツール予算に達したときの案内
+///
+/// ブロックした呼び出しへの応答なので、`is_error: false` で返す前提の文面。
+/// 何回で止まったかと、次に取るべき保存操作を 1 文で示す。
+pub(crate) fn budget_message(
+    tool: &str,
+    max: usize,
+    root_kind: RootKind,
+    save_tool_name: &str,
+    names: &ArrayToolNames,
+) -> String {
+    format!(
+        "{tool} は上限（{max} 回）に達しました。これ以上呼ばず、分かった範囲で {}保存してください。",
+        save_action(root_kind, save_tool_name, names)
+    )
+}
 
 /// ゴール未達のフィードバック
 ///
