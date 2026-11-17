@@ -14,6 +14,28 @@ pub enum RootKind {
     Array,
 }
 
+/// Limits applied when rendering the field list with
+/// [`FillSchema::guide_fields`].
+///
+/// Both limits default to "unlimited": the description is the only hint the
+/// model gets about what to put in a field, so it is truncated only when the
+/// caller asks for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuideOptions {
+    /// Maximum number of characters kept from a `description`.
+    ///
+    /// `0` (the default) keeps the whole description. When greater than zero,
+    /// the text is cut at the last `。` inside the limit if there is one, or
+    /// at the limit itself, and `…` is appended.
+    pub max_description_chars: usize,
+    /// Maximum number of *optional* fields listed.
+    ///
+    /// `None` (the default) lists every field. Required fields are always
+    /// listed, whatever this limit is. When optional fields are dropped, a
+    /// trailing `…他 N 件（任意フィールド）` line reports how many.
+    pub max_fields: Option<usize>,
+}
+
 pub struct FillSchema {
     full: Value,
     partial: Value,
@@ -75,6 +97,67 @@ impl FillSchema {
     pub fn partial(&self) -> &Value {
         &self.partial
     }
+
+    /// Render the field list the model should fill, as bullet lines.
+    ///
+    /// Only the list itself is returned (`- name: string  (必須)  会社名`);
+    /// the heading and the preamble around it are built by
+    /// `prompt::guide_section`. An empty string means "nothing to render",
+    /// so the caller does not leave an empty heading behind.
+    ///
+    /// Odd schemas never panic here: what can be written is written, and an
+    /// unusable schema yields an empty string.
+    pub fn guide_fields(&self, opts: &GuideOptions) -> String {
+        let Some(node) = self.guide_node() else {
+            return String::new();
+        };
+        let Some(properties) = node.get("properties").and_then(Value::as_object) else {
+            return String::new();
+        };
+        if properties.is_empty() {
+            return String::new();
+        }
+
+        let required = required_names(node);
+        let mut lines: Vec<String> = Vec::new();
+        let mut optional_written = 0usize;
+        let mut optional_skipped = 0usize;
+        for (name, prop) in properties {
+            let is_required = required.iter().any(|required| *required == name);
+            if !is_required {
+                if let Some(max) = opts.max_fields
+                    && optional_written >= max
+                {
+                    optional_skipped += 1;
+                    continue;
+                }
+                optional_written += 1;
+            }
+            lines.push(render_field(name, prop, &self.full, is_required, opts));
+        }
+        if optional_skipped > 0 {
+            lines.push(format!("…他 {optional_skipped} 件（任意フィールド）"));
+        }
+        lines.join("\n")
+    }
+
+    /// The schema node that carries the fields to render.
+    ///
+    /// Object mode uses the root; array mode uses the element object behind
+    /// `items` (`$ref` resolved, as schemars emits `#/$defs/Row` there).
+    fn guide_node(&self) -> Option<&Value> {
+        match self.kind {
+            RootKind::Object => Some(&self.full),
+            RootKind::Array => {
+                let items = self.full.get("items")?;
+                match items.get("$ref").and_then(Value::as_str) {
+                    Some(reference) => resolve_local_ref(&self.full, reference),
+                    None => Some(items),
+                }
+            }
+        }
+    }
+
     pub(crate) fn validator(&self) -> &Validator {
         &self.validator
     }
@@ -162,7 +245,7 @@ fn check_flat(
                 reason: format!("$ref cycle at {r}"),
             });
         }
-        let target = resolve_local_ref(root, r, path)?;
+        let target = resolve_local_ref_checked(root, r, path)?;
         stack.push(r.to_string());
         let result = check_flat(root, target, path, allow_object, allow_array, stack);
         stack.pop();
@@ -351,18 +434,198 @@ fn is_scalar_type(name: &str) -> bool {
 }
 
 /// Resolve a local `$ref` (`#`, `#/...`) against `root`.
-fn resolve_local_ref<'a>(root: &'a Value, r: &str, path: &str) -> Result<&'a Value, FillError> {
-    let Some(fragment) = r.strip_prefix('#') else {
+///
+/// Returns `None` for external references and for fragments that do not
+/// exist, so callers that only render text can degrade instead of failing.
+fn resolve_local_ref<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
+    let fragment = reference.strip_prefix('#')?;
+    root.pointer(fragment)
+}
+
+/// Resolve a local `$ref` for schema validation, reporting why it failed.
+fn resolve_local_ref_checked<'a>(
+    root: &'a Value,
+    r: &str,
+    path: &str,
+) -> Result<&'a Value, FillError> {
+    if !r.starts_with('#') {
         return Err(FillError::UnsupportedSchemaShape {
             path: display_path_for_schema(path),
             reason: "external $ref is unsupported".to_string(),
         });
+    }
+    resolve_local_ref(root, r).ok_or_else(|| FillError::UnsupportedSchemaShape {
+        path: display_path_for_schema(path),
+        reason: format!("$ref target '{r}' not found"),
+    })
+}
+
+/// The `required` names of an object node, empty when absent.
+fn required_names(node: &Value) -> Vec<&str> {
+    node.get("required")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// Render one bullet: `- name: string  (必須)  会社名`.
+fn render_field(
+    name: &str,
+    prop: &Value,
+    root: &Value,
+    required: bool,
+    opts: &GuideOptions,
+) -> String {
+    let mut line = format!("- {name}: {}", type_label(prop, root, 0));
+    if required {
+        line.push_str("  (必須)");
+    }
+    if let Some(description) = prop.get("description").and_then(Value::as_str) {
+        let text = one_line(description, opts.max_description_chars);
+        if !text.is_empty() {
+            line.push_str("  ");
+            line.push_str(&text);
+        }
+    }
+    line
+}
+
+/// Render the type of a field, with `$ref` resolved and constraints appended.
+fn type_label(schema: &Value, root: &Value, depth: usize) -> String {
+    // Deep or cyclic references stop here instead of recursing forever.
+    if depth > 4 {
+        return "any".to_string();
+    }
+    let Some(obj) = schema.as_object() else {
+        return "any".to_string();
     };
-    root.pointer(fragment)
-        .ok_or_else(|| FillError::UnsupportedSchemaShape {
-            path: display_path_for_schema(path),
-            reason: format!("$ref target '{r}' not found"),
-        })
+
+    if let Some(reference) = obj.get("$ref").and_then(Value::as_str) {
+        return match resolve_local_ref(root, reference) {
+            Some(target) => type_label(target, root, depth + 1),
+            None => "any".to_string(),
+        };
+    }
+    if let Some(value) = obj.get("const") {
+        return value.to_string();
+    }
+    if let Some(values) = obj.get("enum").and_then(Value::as_array) {
+        return enum_label(values, obj);
+    }
+    if let Some(branches) = obj
+        .get("anyOf")
+        .or_else(|| obj.get("oneOf"))
+        .and_then(Value::as_array)
+        && !branches.is_empty()
+    {
+        let mut labels: Vec<String> = Vec::new();
+        for branch in branches {
+            let label = type_label(branch, root, depth + 1);
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+        return labels.join(" | ");
+    }
+
+    let declared = type_names(obj).unwrap_or_default();
+    let scalars: Vec<&str> = declared
+        .iter()
+        .copied()
+        .filter(|name| is_scalar_type(name))
+        .collect();
+
+    let mut base = if declared.contains(&"array") || obj.get("items").is_some() {
+        let inner = obj
+            .get("items")
+            .map(|items| type_label(items, root, depth + 1))
+            .filter(|label| label != "any")
+            .unwrap_or_else(|| "object".to_string());
+        format!("array<{inner}>")
+    } else if declared.contains(&"object") {
+        "object".to_string()
+    } else if scalars.is_empty() {
+        "any".to_string()
+    } else {
+        scalars.join(" | ")
+    };
+    // A nullable array keeps its `null` next to the element type.
+    if base.starts_with("array<") && !scalars.is_empty() {
+        base.push_str(" | ");
+        base.push_str(&scalars.join(" | "));
+    }
+
+    match constraints_label(obj) {
+        Some(constraints) => format!("{base}  ({constraints})"),
+        None => base,
+    }
+}
+
+/// Render up to five `enum` values as `one of "a" | "b"`.
+fn enum_label(values: &[Value], obj: &serde_json::Map<String, Value>) -> String {
+    let parts: Vec<String> = values
+        .iter()
+        .take(5)
+        .map(|value| value.to_string())
+        .collect();
+    let mut label = format!("one of {}", parts.join(" | "));
+    if values.len() > 5 {
+        label.push_str(" | …");
+    }
+    match constraints_label(obj) {
+        Some(constraints) => format!("{label}  ({constraints})"),
+        None => label,
+    }
+}
+
+/// `format` / `minimum` / `maximum` / `maxLength`, in that order.
+fn constraints_label(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(format) = obj.get("format").and_then(Value::as_str) {
+        parts.push(format!("format: {format}"));
+    }
+    if let Some(minimum) = obj.get("minimum") {
+        parts.push(format!("min: {minimum}"));
+    }
+    if let Some(maximum) = obj.get("maximum") {
+        parts.push(format!("max: {maximum}"));
+    }
+    if let Some(max_length) = obj.get("maxLength") {
+        parts.push(format!("maxLength: {max_length}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+/// Collapse a description to one line and, when `max_chars` is not `0`, cut
+/// it (at the last `。` inside the limit when possible) with a `…` marker.
+fn one_line(text: &str, max_chars: usize) -> String {
+    let mut flat = String::new();
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            pending_space = !flat.is_empty();
+            continue;
+        }
+        if pending_space {
+            flat.push(' ');
+            pending_space = false;
+        }
+        flat.push(ch);
+    }
+
+    if max_chars == 0 || flat.chars().count() <= max_chars {
+        return flat;
+    }
+    let head: String = flat.chars().take(max_chars).collect();
+    let cut = match head.rfind('。') {
+        Some(index) => head[..index + '。'.len_utf8()].trim_end().to_string(),
+        None => head.trim_end().to_string(),
+    };
+    format!("{cut}…")
 }
 
 fn display_path_for_schema(path: &str) -> String {
@@ -989,6 +1252,159 @@ mod tests {
     fn for_type_rejects_nested_struct() {
         let err = FillSchema::for_type::<NestedRow>().unwrap_err();
         assert!(matches!(err, FillError::UnsupportedSchemaShape { .. }));
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[allow(dead_code)]
+    struct GuideCompany {
+        /// 会社名
+        name: String,
+        /// 従業員数
+        employees: Option<u32>,
+        /// タグ
+        tags: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[allow(dead_code)]
+    struct GuideRow {
+        /// 市場キー
+        market_key: String,
+        /// 売上シェア
+        sales_share: Option<f64>,
+    }
+
+    fn guide(schema: &FillSchema) -> String {
+        schema.guide_fields(&GuideOptions::default())
+    }
+
+    #[test]
+    fn guide_fields_marks_required() {
+        let schema = FillSchema::for_type::<GuideCompany>().expect("schema");
+        let text = guide(&schema);
+        assert!(text.contains("- name: string  (必須)"), "{text}");
+        assert!(text.contains("- tags: array<string>  (必須)"), "{text}");
+        assert!(
+            !text.contains("- employees: integer | null  (必須)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn guide_fields_renders_union_and_array() {
+        let schema = FillSchema::for_type::<GuideCompany>().expect("schema");
+        let text = guide(&schema);
+        assert!(text.contains("- employees: integer | null"), "{text}");
+        assert!(text.contains("- tags: array<string>"), "{text}");
+    }
+
+    #[test]
+    fn guide_fields_includes_constraints() {
+        let schema = FillSchema::from_value(json!({
+            "type": "object",
+            "properties": {
+                "status": { "type": "string", "enum": ["active", "closed"] },
+                "age": { "type": "integer", "minimum": 0, "maximum": 120 },
+                "code": { "type": "string", "maxLength": 8 }
+            },
+            "required": ["status"]
+        }))
+        .expect("schema");
+        let text = guide(&schema);
+        assert!(text.contains(r#"one of "active" | "closed""#), "{text}");
+        assert!(text.contains("min: 0"), "{text}");
+        assert!(text.contains("max: 120"), "{text}");
+        assert!(text.contains("maxLength: 8"), "{text}");
+    }
+
+    #[test]
+    fn guide_fields_includes_doc_comment() {
+        let schema = FillSchema::for_type::<GuideCompany>().expect("schema");
+        let text = guide(&schema);
+        let name_line = text
+            .lines()
+            .find(|line| line.starts_with("- name:"))
+            .expect("name line");
+        assert_eq!(name_line, "- name: string  (必須)  会社名");
+    }
+
+    #[test]
+    fn guide_fields_resolves_ref_for_array_items() {
+        let schema = FillSchema::for_type::<Vec<GuideRow>>().expect("schema");
+        let text = guide(&schema);
+        assert!(text.contains("- market_key: string  (必須)"), "{text}");
+        assert!(text.contains("- sales_share: number | null"), "{text}");
+    }
+
+    #[test]
+    fn guide_fields_truncates_description_only_when_configured() {
+        let schema = FillSchema::from_value(json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "会社名です。とても長い説明がここに続きます。"
+                }
+            }
+        }))
+        .expect("schema");
+
+        let full = guide(&schema);
+        assert!(
+            full.contains("会社名です。とても長い説明がここに続きます。"),
+            "{full}"
+        );
+
+        let short = schema.guide_fields(&GuideOptions {
+            max_description_chars: 8,
+            max_fields: None,
+        });
+        assert!(short.contains("会社名です。…"), "{short}");
+        assert!(!short.contains("とても"), "{short}");
+    }
+
+    #[test]
+    fn guide_fields_keeps_required_when_max_fields_hits() {
+        let schema = FillSchema::from_value(json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "string" },
+                "b": { "type": "string" },
+                "c": { "type": "string" },
+                "d": { "type": "string" }
+            },
+            "required": ["a", "b"]
+        }))
+        .expect("schema");
+        let text = schema.guide_fields(&GuideOptions {
+            max_description_chars: 0,
+            max_fields: Some(1),
+        });
+        assert!(text.contains("- a:"), "{text}");
+        assert!(text.contains("- b:"), "{text}");
+        assert!(text.contains("- c:"), "{text}");
+        assert!(!text.contains("- d:"), "{text}");
+        assert!(text.contains("…他 1 件（任意フィールド）"), "{text}");
+    }
+
+    #[test]
+    fn guide_fields_never_panics_on_odd_schema() {
+        let empty = FillSchema::from_value(json!({
+            "type": "object",
+            "properties": {}
+        }))
+        .expect("schema");
+        assert_eq!(guide(&empty), "");
+
+        // Unresolvable references and non-object schemas degrade to `any`
+        // instead of panicking.
+        let root = json!({});
+        assert_eq!(
+            type_label(&json!({"$ref": "#/$defs/Missing"}), &root, 0),
+            "any"
+        );
+        assert_eq!(type_label(&json!("nonsense"), &root, 0), "any");
+        assert_eq!(type_label(&json!({}), &root, 0), "any");
     }
 
     fn loc() -> Location {

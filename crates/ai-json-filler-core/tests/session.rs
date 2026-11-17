@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use ai_json_filler_core::{
-    BoxFuture, FeedbackOptions, FillError, FillSession, SessionResult, Tool, ToolOutput, ToolSpec,
+    BoxFuture, FeedbackOptions, FillError, FillSession, GuideOptions, SessionResult, Tool,
+    ToolOutput, ToolSpec,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -678,4 +679,66 @@ async fn array_mode_custom_tool_names() {
     assert!(names.iter().any(|n| n == "add_rows"), "{names:?}");
     assert!(names.iter().any(|n| n == "patch_row"), "{names:?}");
     assert!(names.iter().any(|n| n == "drop_row"), "{names:?}");
+
+    // カスタム名はツール一覧だけでなくプロンプト本文にも反映される
+    let prompt = session.system_prompt();
+    assert!(!prompt.contains(" update "), "{prompt}");
+    assert!(prompt.contains("patch_row を使い"), "{prompt}");
+}
+
+#[test]
+fn system_prompt_contains_guide() {
+    let object = new_session().system_prompt();
+    assert!(object.contains("【保存する JSON の形】"), "{object}");
+    assert!(object.contains("- name: string  (必須)"), "{object}");
+    assert!(object.contains("- employees: integer"), "{object}");
+
+    let array = array_session().system_prompt();
+    assert!(array.contains("【要素の形】"), "{array}");
+    assert!(array.contains("append の items"), "{array}");
+    assert!(array.contains("- name: string  (必須)"), "{array}");
+    assert!(array.contains("- note: string  (必須)"), "{array}");
+}
+
+#[test]
+fn with_schema_guide_false_excludes_guide() {
+    let with_guide = new_session().system_prompt();
+    let without_guide = new_session().with_schema_guide(false).system_prompt();
+
+    assert!(
+        with_guide.contains("【保存する JSON の形】"),
+        "{with_guide}"
+    );
+    assert!(
+        !without_guide.contains("【保存する JSON の形】"),
+        "{without_guide}"
+    );
+    assert!(!without_guide.contains("- name: string"), "{without_guide}");
+    // The rest of the prompt is unchanged.
+    assert!(without_guide.contains("【保存の手順】"), "{without_guide}");
+    assert!(without_guide.contains("【言語】"), "{without_guide}");
+    assert!(without_guide.len() < with_guide.len());
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct DescribedCompany {
+    /// 会社名です。とても長い説明がここに続きます。
+    name: String,
+}
+
+#[test]
+fn with_guide_options_changes_output() {
+    let session = FillSession::<DescribedCompany>::new("調べて").expect("session");
+    let full = session.system_prompt();
+    assert!(full.contains("とても長い説明"), "{full}");
+
+    let session = session.with_guide_options(GuideOptions {
+        max_description_chars: 10,
+        max_fields: None,
+    });
+    assert_eq!(session.guide_options().max_description_chars, 10);
+    let truncated = session.system_prompt();
+    assert!(truncated.contains("会社名です。…"), "{truncated}");
+    assert!(!truncated.contains("とても"), "{truncated}");
 }

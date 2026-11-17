@@ -9,8 +9,8 @@ use jsonschema::paths::Location;
 
 use crate::feedback::{FeedbackOptions, empty_args_feedback, format_validation_feedback};
 use crate::give_up::{self, DEFAULT_GIVE_UP_TOOL_NAME, GiveUp};
-use crate::prompt::{SAVE_DESCRIPTION, build_system_prompt};
-use crate::schema::{collect_extra_keys, deep_merge, display_path, strip_extra_keys};
+use crate::prompt::{SAVE_DESCRIPTION, build_system_prompt, guide_section};
+use crate::schema::{GuideOptions, collect_extra_keys, deep_merge, display_path, strip_extra_keys};
 use crate::{
     ArrayToolNames, DEFAULT_SAVE_TOOL_NAME, FillError, FillSchema, RootKind, Tool, ToolSet,
     ToolSpec,
@@ -52,6 +52,8 @@ pub struct FillSession<T> {
     warnings: Vec<String>,
     save_calls: usize,
     done: bool,
+    schema_guide: bool,
+    guide_options: GuideOptions,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -96,6 +98,8 @@ where
             warnings: Vec::new(),
             save_calls: 0,
             done: false,
+            schema_guide: true,
+            guide_options: GuideOptions::default(),
             _marker: PhantomData,
         })
     }
@@ -103,6 +107,25 @@ where
     pub fn with_feedback_options(mut self, options: FeedbackOptions) -> Self {
         self.feedback = options;
         self
+    }
+
+    /// Whether the system prompt lists the fields to fill. Defaults to `true`.
+    ///
+    /// Turn it off to get the prompt as it was before the field guide existed.
+    pub fn with_schema_guide(mut self, enabled: bool) -> Self {
+        self.schema_guide = enabled;
+        self
+    }
+
+    /// Set the limits used when rendering the field list. Defaults to
+    /// unlimited descriptions and unlimited fields.
+    pub fn with_guide_options(mut self, options: GuideOptions) -> Self {
+        self.guide_options = options;
+        self
+    }
+
+    pub fn guide_options(&self) -> &GuideOptions {
+        &self.guide_options
     }
 
     /// Override the name of the tool used for partial saves.
@@ -193,14 +216,24 @@ where
     }
 
     pub fn system_prompt(&self) -> String {
-        build_system_prompt(
+        let mut out = build_system_prompt(
             &self.prompt,
             self.schema.root_kind(),
             &self.save_tool_name,
             &self.give_up_tool_name,
             &self.array_tool_names,
             &self.tools,
-        )
+        );
+        if self.schema_guide {
+            let fields = self.schema.guide_fields(&self.guide_options);
+            out.push_str(&guide_section(
+                self.schema.root_kind(),
+                &self.save_tool_name,
+                &self.array_tool_names,
+                &fields,
+            ));
+        }
+        out
     }
 
     pub fn tool_specs(&self) -> Vec<ToolSpec> {

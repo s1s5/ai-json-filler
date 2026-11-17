@@ -186,6 +186,36 @@ let outcome = fill::<CompanyProfile>(&client, "qwen3:8b", "調べて")
 
 LLM 無しで 4 ステップを実演する例が `crates/ai-json-filler-core/examples/manual_loop.rs`。`&self` でツールを呼ぶフレームワーク向けに、`Arc<tokio::sync::Mutex<Option<FillSession<T>>>>` で包んで `Done` で `take()` する例が `crates/ai-json-filler-core/examples/session_tool.rs` にある。
 
+## プロンプトに入るフィールド一覧
+
+`system_prompt()` は末尾（`【言語】` の後）に、保存すべきフィールドの一覧を付ける。ツール定義（`parameters`）を読まないモデルでも、キー名・型・必須/任意が分かるようにするため。
+
+```text
+【保存する JSON の形】
+save_result の引数は 1 つのオブジェクトです。キーに `.` や `[0]` を付けず、値はそのままの型で書いてください。
+
+- employees: integer | null  (format: uint32, min: 0)  従業員数
+- name: string  (必須)  会社名
+- tags: array<string>  (必須)  タグ
+```
+
+Array モードでは見出しが `【要素の形】` になり、`append` の `items` / `update` の `patch` に入れる要素の形として同じ一覧を出す。要素の `$ref`（`#/$defs/Row`）はローカル解決してから列挙する。
+
+- 一覧を消す: `FillSession::with_schema_guide(false)`（既定 `true`）。差し戻すと従来のプロンプトに戻る。
+- 出力を絞る: `FillSession::with_guide_options(GuideOptions { .. })`。現在値は `guide_options()` で読める。
+
+```rust
+use ai_json_filler_core::GuideOptions;
+
+let session = FillSession::<CompanyProfile>::new("調べて")?
+    .with_guide_options(GuideOptions {
+        max_description_chars: 80, // 0（既定）は無制限
+        max_fields: Some(20),      // None（既定）は無制限。必須は削らない
+    });
+```
+
+`max_description_chars` は既定で無制限。説明文は「何を入れるか」の唯一の手掛かりなので、切るかどうかは呼び出し側が決める。切ったときは `…` が付く。`max_fields` は**任意フィールドだけ**を制限し、超えた分は `…他 N 件（任意フィールド）` と表示する。必須フィールドは常に全部出る。
+
 ## 不可能の報告
 
 LLM が「これ以上調べても値が分からない」と判断したときは、`give_up` ツールで理由付きの打ち切りを宣言できる。ループ上限（`max_turns` / `max_rounds`）による打ち切りと区別できるのが目的。

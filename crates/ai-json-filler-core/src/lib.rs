@@ -13,7 +13,7 @@ pub use array::ArrayToolNames;
 pub use error::FillError;
 pub use feedback::FeedbackOptions;
 pub use give_up::{DEFAULT_GIVE_UP_TOOL_NAME, GiveUp};
-pub use schema::{FillSchema, RootKind};
+pub use schema::{FillSchema, GuideOptions, RootKind};
 pub use session::{FillOutcome, FillSession, SessionResult};
 pub use tool::{Tool, ToolOutput, ToolSet, ToolSpec};
 pub use typed_tool::{TypedTool, typed_tool};

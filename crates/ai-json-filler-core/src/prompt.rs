@@ -44,7 +44,9 @@ pub(crate) fn build_system_prompt(
                 "- {remove}: index の要素を削除する。削除後、後ろの index は前に詰まる\n"
             ));
             out.push_str("- index は 0 始まり\n");
-            out.push_str("- 既存要素を書き換えるときは update を使い、配列全体を送り直さない\n");
+            out.push_str(&format!(
+                "- 既存要素を書き換えるときは {update} を使い、配列全体を送り直さない\n"
+            ));
             out.push_str("- 要素の順序を保つ。削除後の index のずれに注意する\n");
             out.push_str("- 不明な項目は省略してよい。推測で値を埋めない\n");
         }
@@ -81,4 +83,90 @@ pub(crate) fn build_system_prompt(
     out.push('\n');
     out.push_str(LANGUAGE_RULES);
     out
+}
+
+/// The heading and preamble for the field list, followed by `fields`.
+///
+/// Returns an empty string when `fields` is empty, so no empty heading is
+/// left behind. Tool names appear here (not in `schema.rs`) because both the
+/// save tool and the array tools can be renamed by the caller.
+pub(crate) fn guide_section(
+    kind: RootKind,
+    save_tool: &str,
+    array_names: &ArrayToolNames,
+    fields: &str,
+) -> String {
+    if fields.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("\n\n");
+    match kind {
+        RootKind::Object => {
+            out.push_str("【保存する JSON の形】\n");
+            out.push_str(&format!(
+                "{save_tool} の引数は 1 つのオブジェクトです。キーに `.` や `[0]` を付けず、値はそのままの型で書いてください。\n\n"
+            ));
+        }
+        RootKind::Array => {
+            out.push_str("【要素の形】\n");
+            out.push_str(&format!(
+                "{} の items、{} の patch には、次の形のオブジェクトを入れてください。入れ子にはせず、キーに `.` や `[0]` を付けないでください。\n\n",
+                array_names.append, array_names.update
+            ));
+        }
+    }
+    out.push_str(fields);
+    out.push('\n');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_names() -> ArrayToolNames {
+        ArrayToolNames::default()
+    }
+
+    #[test]
+    fn guide_section_object_uses_save_tool_name() {
+        let section = guide_section(
+            RootKind::Object,
+            "store_fields",
+            &default_names(),
+            "- name: string  (必須)  会社名",
+        );
+        assert!(section.contains("【保存する JSON の形】"), "{section}");
+        assert!(section.contains("store_fields の引数"), "{section}");
+        assert!(
+            section.contains("- name: string  (必須)  会社名"),
+            "{section}"
+        );
+    }
+
+    #[test]
+    fn guide_section_array_uses_custom_names() {
+        let names = ArrayToolNames {
+            append: "add_rows".to_string(),
+            update: "patch_row".to_string(),
+            remove: "drop_row".to_string(),
+        };
+        let section = guide_section(
+            RootKind::Array,
+            "save_result",
+            &names,
+            "- market_key: string  (必須)",
+        );
+        assert!(section.contains("【要素の形】"), "{section}");
+        assert!(section.contains("add_rows の items"), "{section}");
+        assert!(section.contains("patch_row の patch"), "{section}");
+        assert!(!section.contains("save_result"), "{section}");
+    }
+
+    #[test]
+    fn guide_section_is_empty_when_fields_empty() {
+        assert!(guide_section(RootKind::Object, "save_result", &default_names(), "").is_empty());
+        assert!(guide_section(RootKind::Array, "save_result", &default_names(), "").is_empty());
+    }
 }
