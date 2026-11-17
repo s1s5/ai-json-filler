@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -13,7 +13,10 @@ use crate::feedback::{
 };
 use crate::give_up::{self, DEFAULT_GIVE_UP_TOOL_NAME, GiveUp};
 use crate::goal::{self, GoalEmpty, GoalPath, GoalReport};
-use crate::prompt::{SAVE_DESCRIPTION, build_system_prompt, guide_section};
+use crate::prompt::{
+    GuideMode, PromptAudit, PromptParts, PromptSection, PromptSectionSource, PromptSectionView,
+    SAVE_DESCRIPTION, has_placeholder, render_section, substitute,
+};
 use crate::schema::{GuideOptions, collect_extra_keys, deep_merge, strip_extra_keys};
 use crate::{
     ArrayToolNames, DEFAULT_SAVE_TOOL_NAME, FillError, FillSchema, RootKind, Tool, ToolSet,
@@ -21,8 +24,9 @@ use crate::{
 };
 
 /// プロンプト構成の版。`SAVE_DESCRIPTION`・ガイド見出し・
-/// ゴール案内・予算メッセージを変えたら手で上げる。
-pub const PROMPT_VERSION: &str = "save-contract-v3";
+/// ゴール案内・予算メッセージ・開始メッセージ・強制保存メッセージを変えたら
+/// 手で上げる。
+pub const PROMPT_VERSION: &str = "save-contract-v4";
 
 pub enum SessionResult {
     Continue {
@@ -51,6 +55,45 @@ pub enum ExtraKeys {
     Reject,
 }
 
+/// What the caller changed about the prompt sections.
+///
+/// A section is in at most one of the two sets: replacing a disabled section
+/// enables it again, and disabling a replaced section drops the template.
+#[derive(Debug, Default)]
+struct PromptOverrides {
+    sections: BTreeMap<PromptSection, String>,
+    disabled: BTreeSet<PromptSection>,
+}
+
+impl PromptOverrides {
+    fn replace(&mut self, section: PromptSection, template: String) {
+        self.disabled.remove(&section);
+        self.sections.insert(section, template);
+    }
+
+    fn disable(&mut self, section: PromptSection) {
+        self.sections.remove(&section);
+        self.disabled.insert(section);
+    }
+
+    fn reset(&mut self, section: PromptSection) {
+        self.sections.remove(&section);
+        self.disabled.remove(&section);
+    }
+
+    fn template(&self, section: PromptSection) -> Option<&str> {
+        self.sections.get(&section).map(String::as_str)
+    }
+
+    fn has_template(&self, section: PromptSection) -> bool {
+        self.sections.contains_key(&section)
+    }
+
+    fn is_disabled(&self, section: PromptSection) -> bool {
+        self.disabled.contains(&section)
+    }
+}
+
 #[non_exhaustive]
 pub struct FillOutcome<T> {
     pub value: T,
@@ -62,7 +105,7 @@ pub struct FillOutcome<T> {
     /// 数え方は `tool_calls` と同じで、give_up の足切りに使う総数の
     /// 内訳になる。ツール予算の効果測定用。
     pub tool_calls_by_name: BTreeMap<String, usize>,
-    /// この結果を生成したプロンプトの版（例: `"save-contract-v3+stock-3"`）
+    /// この結果を生成したプロンプトの版（例: `"save-contract-v4+stock-3"`）
     pub prompt_version: String,
 }
 
@@ -88,8 +131,10 @@ pub struct FillSession<T> {
     save_calls: usize,
     prompt_version: String,
     done: bool,
-    schema_guide: bool,
+    guide_mode: GuideMode,
     guide_options: GuideOptions,
+    overrides: PromptOverrides,
+    explicit_save_tool_name: bool,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -141,8 +186,10 @@ where
             save_calls: 0,
             prompt_version: PROMPT_VERSION.to_string(),
             done: false,
-            schema_guide: true,
+            guide_mode: GuideMode::default(),
             guide_options: GuideOptions::default(),
+            overrides: PromptOverrides::default(),
+            explicit_save_tool_name: false,
             _marker: PhantomData,
         })
     }
@@ -205,9 +252,29 @@ where
     /// Whether the system prompt lists the fields to fill. Defaults to `true`.
     ///
     /// Turn it off to get the prompt as it was before the field guide existed.
+    /// `true` is [`GuideMode::FieldsWithToolNames`], `false` is
+    /// [`GuideMode::Off`]; use [`Self::with_guide_mode`] to keep the list but
+    /// drop the sentence that names the save tools.
     pub fn with_schema_guide(mut self, enabled: bool) -> Self {
-        self.schema_guide = enabled;
+        self.guide_mode = if enabled {
+            GuideMode::FieldsWithToolNames
+        } else {
+            GuideMode::Off
+        };
         self
+    }
+
+    /// How much of the field list the system prompt carries.
+    ///
+    /// Defaults to [`GuideMode::FieldsWithToolNames`]. A `Guide` section that
+    /// was replaced with [`Self::with_prompt_section`] wins over the mode.
+    pub fn with_guide_mode(mut self, mode: GuideMode) -> Self {
+        self.guide_mode = mode;
+        self
+    }
+
+    pub fn guide_mode(&self) -> GuideMode {
+        self.guide_mode
     }
 
     /// Set the limits used when rendering the field list. Defaults to
@@ -221,8 +288,155 @@ where
         &self.guide_options
     }
 
+    /// The task text given to [`Self::new`] / [`Self::with_seed`].
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    /// Replace the text of one prompt section.
+    ///
+    /// Placeholders in `template` are filled from the current settings, so a
+    /// caller does not have to know which mode the session runs in:
+    ///
+    /// | placeholder | becomes |
+    /// |---|---|
+    /// | `{save}` | the save tool name (object mode only) |
+    /// | `{append}` `{update}` `{remove}` | the array tool names (array mode only) |
+    /// | `{give_up}` | the give-up tool name |
+    /// | `{fields}` | the field list ([`PromptSection::Guide`] only) |
+    ///
+    /// An unknown placeholder, a placeholder that belongs to the other mode, or
+    /// a guide template without `{fields}` is a [`FillError`] here, at
+    /// construction time, rather than a prompt the model silently misreads.
+    /// Only identifier-shaped braces are placeholders, so JSON examples such as
+    /// `{"name": "x"}` are copied through as written.
+    ///
+    /// Unlike the other `with_*` setters this returns a `Result`. That
+    /// asymmetry is deliberate: a wrong section is not something to ignore.
+    pub fn with_prompt_section(
+        mut self,
+        section: PromptSection,
+        template: impl Into<String>,
+    ) -> Result<Self, FillError> {
+        let template = template.into();
+        if section == PromptSection::Guide && !has_placeholder(&template, "fields") {
+            return Err(FillError::MissingFieldsPlaceholder { section });
+        }
+        let parts = self.prompt_parts();
+        substitute(&template, section, &parts)?;
+        self.overrides.replace(section, template);
+        Ok(self)
+    }
+
+    /// Drop a section from the prompt.
+    ///
+    /// A replaced section is dropped as well; use [`Self::reset_prompt_section`]
+    /// to go back to the built-in text.
+    pub fn without_prompt_section(mut self, section: PromptSection) -> Self {
+        self.overrides.disable(section);
+        self
+    }
+
+    /// Restore the built-in text of a section.
+    pub fn reset_prompt_section(mut self, section: PromptSection) -> Self {
+        self.overrides.reset(section);
+        self
+    }
+
+    /// The current state of one section.
+    ///
+    /// `rendered` is rebuilt from the current tool names and guide settings
+    /// every time, through the same path `system_prompt()` uses, so the two
+    /// cannot drift apart.
+    pub fn prompt_section(&self, section: PromptSection) -> PromptSectionView<'_> {
+        let parts = self.prompt_parts();
+        self.section_view(section, &parts)
+    }
+
+    /// Every section, in [`PromptSection::ALL`] order.
+    ///
+    /// Useful for snapshots and diffs: the six entries are always the same six.
+    pub fn prompt_sections(&self) -> Vec<(PromptSection, PromptSectionView<'_>)> {
+        let parts = self.prompt_parts();
+        PromptSection::ALL
+            .iter()
+            .map(|&section| (section, self.section_view(section, &parts)))
+            .collect()
+    }
+
+    pub fn is_prompt_section_disabled(&self, section: PromptSection) -> bool {
+        self.overrides.is_disabled(section)
+    }
+
+    /// Look for prompt mistakes that would mislead the model.
+    ///
+    /// This never fails: a renamed tool is legitimate, so an unfamiliar name
+    /// is reported, not rejected. The default configuration reports nothing;
+    /// asserting `prompt_audit().warnings.is_empty()` in a test pins that.
+    pub fn prompt_audit(&self) -> PromptAudit {
+        let system = self.system_prompt();
+        let start = self.start_message();
+        let save_only = self.save_only_message();
+        let mut audit = PromptAudit::default();
+
+        let advertised: Vec<&str> = match self.schema.root_kind() {
+            RootKind::Object => vec![self.save_tool_name.as_str()],
+            RootKind::Array => self.array_tool_names.all().to_vec(),
+        };
+        for name in &advertised {
+            if !system.contains(name) {
+                audit.warn(format!(
+                    "保存ツール名 '{name}' がシステムプロンプトに含まれていません"
+                ));
+            }
+            if !start.contains(name) {
+                audit.warn(format!(
+                    "保存ツール名 '{name}' が開始メッセージに含まれていません"
+                ));
+            }
+            if !save_only.contains(name) {
+                audit.warn(format!(
+                    "保存ツール名 '{name}' が強制保存メッセージに含まれていません"
+                ));
+            }
+        }
+
+        if !system.contains(&self.give_up_tool_name) && !start.contains(&self.give_up_tool_name) {
+            audit.warn(format!(
+                "give-up ツール名 '{}' がプロンプトに含まれていません",
+                self.give_up_tool_name
+            ));
+        }
+
+        if self.schema.is_array() {
+            let save = self.save_tool_name.as_str();
+            if self.explicit_save_tool_name {
+                audit.warn(format!(
+                    "save_tool_name '{save}' は配列モードでは使われません（設定ミス）"
+                ));
+            } else if !self.tools.contains(save)
+                && (system.contains(save) || start.contains(save) || save_only.contains(save))
+            {
+                audit.warn(format!(
+                    "配列モードでは使われない保存ツール名 '{save}' がプロンプトに含まれています"
+                ));
+            }
+        }
+
+        audit
+    }
+
+    /// Run [`Self::prompt_audit`] now and merge the warnings into
+    /// [`Self::warnings`], so they end up in [`FillOutcome::warnings`].
+    pub fn with_prompt_audit(mut self) -> Self {
+        for warning in self.prompt_audit().warnings {
+            self.push_warning(warning);
+        }
+        self
+    }
+
     /// 呼び出し側の版を連結する（例: `"stock-3"` →
-    /// `"save-contract-v3+stock-3"`）。空文字・空白のみは無視する。
+    /// `"save-contract-v4+stock-3"`）。空文字・空白のみは無視する。
     pub fn with_prompt_version(mut self, suffix: impl Into<String>) -> Self {
         let suffix = suffix.into();
         let trimmed = suffix.trim();
@@ -240,17 +454,48 @@ where
     /// Override the name of the tool used for partial saves.
     ///
     /// Empty or whitespace-only names are ignored, and so is a name already
-    /// used by the give-up tool.
+    /// used by the give-up tool or by one of the array tools. An ignored name
+    /// is reported through [`Self::warnings`]; use
+    /// [`Self::try_with_save_tool_name`] to get an error instead.
+    ///
+    /// The name is unused in array mode: the start message and the advertised
+    /// tools all come from [`ArrayToolNames`] there. Because a collision is
+    /// resolved by ignoring whichever name is applied second, the genai
+    /// builder applies the array names first in array mode so that the names
+    /// that actually appear in the tool list win.
     pub fn with_save_tool_name(mut self, name: impl Into<String>) -> Self {
-        let name = name.into();
-        let trimmed = name.trim();
-        if !trimmed.is_empty()
-            && trimmed != self.give_up_tool_name
-            && !self.array_tool_names.all().contains(&trimmed)
-        {
-            self.save_tool_name = trimmed.to_string();
+        let name = name.into().trim().to_string();
+        if let Some(reason) = self.save_name_problem(&name) {
+            self.push_warning(format!("保存ツール名 '{name}' を無視しました: {reason}"));
+        } else {
+            self.save_tool_name = name;
+            self.explicit_save_tool_name = true;
         }
         self
+    }
+
+    /// [`Self::with_save_tool_name`], but an unusable name is an error.
+    pub fn try_with_save_tool_name(mut self, name: impl Into<String>) -> Result<Self, FillError> {
+        let name = name.into().trim().to_string();
+        if let Some(reason) = self.save_name_problem(&name) {
+            return Err(FillError::InvalidToolName { name, reason });
+        }
+        self.save_tool_name = name;
+        self.explicit_save_tool_name = true;
+        Ok(self)
+    }
+
+    fn save_name_problem(&self, name: &str) -> Option<String> {
+        if name.is_empty() {
+            return Some("空の名前は使えません".to_string());
+        }
+        if name == self.give_up_tool_name.as_str() {
+            return Some("give-up ツール名と衝突しています".to_string());
+        }
+        if self.array_tool_names.all().contains(&name) {
+            return Some("配列ツール名と衝突しています".to_string());
+        }
+        None
     }
 
     pub fn save_tool_name(&self) -> &str {
@@ -260,20 +505,41 @@ where
     /// Override the three tool names used in array mode.
     ///
     /// Empty names, duplicate names, and names that collide with the save or
-    /// give-up tool are ignored as a set.
+    /// give-up tool are ignored **as a set**: one bad name keeps all three at
+    /// their defaults rather than leaving a half-renamed trio. The ignored call
+    /// is reported through [`Self::warnings`].
     pub fn with_array_tool_names(mut self, names: ArrayToolNames) -> Self {
-        let Some(names) = names.normalized() else {
-            return self;
-        };
+        match self.array_names_problem(&names) {
+            Some(reason) => self.push_warning(format!("配列ツール名を無視しました: {reason}")),
+            None => self.array_tool_names = names.normalized().expect("checked above"),
+        }
+        self
+    }
+
+    /// [`Self::with_array_tool_names`], but an unusable set is an error.
+    pub fn try_with_array_tool_names(mut self, names: ArrayToolNames) -> Result<Self, FillError> {
+        if let Some(reason) = self.array_names_problem(&names) {
+            return Err(FillError::InvalidToolName {
+                name: format!("{}/{}/{}", names.append, names.update, names.remove),
+                reason,
+            });
+        }
+        self.array_tool_names = names.normalized().expect("checked above");
+        Ok(self)
+    }
+
+    fn array_names_problem(&self, names: &ArrayToolNames) -> Option<String> {
+        if names.clone().normalized().is_none() {
+            return Some("名前が空か重複しています".to_string());
+        }
         if names
             .all()
             .iter()
             .any(|name| *name == self.save_tool_name || *name == self.give_up_tool_name)
         {
-            return self;
+            return Some("保存ツール名または give-up ツール名と衝突しています".to_string());
         }
-        self.array_tool_names = names;
-        self
+        None
     }
 
     pub fn array_tool_names(&self) -> &ArrayToolNames {
@@ -293,17 +559,45 @@ where
     /// Override the name of the tool that declares the goal unreachable.
     ///
     /// Empty or whitespace-only names are ignored, and so is a name already
-    /// used by the save tool.
+    /// used by the save tool. An ignored name is reported through
+    /// [`Self::warnings`]; use [`Self::try_with_give_up_tool_name`] to get an
+    /// error instead.
     pub fn with_give_up_tool_name(mut self, name: impl Into<String>) -> Self {
-        let name = name.into();
-        let trimmed = name.trim();
-        if !trimmed.is_empty()
-            && trimmed != self.save_tool_name
-            && !self.array_tool_names.all().contains(&trimmed)
-        {
-            self.give_up_tool_name = trimmed.to_string();
+        let name = name.into().trim().to_string();
+        if let Some(reason) = self.give_up_name_problem(&name) {
+            self.push_warning(format!(
+                "give-up ツール名 '{name}' を無視しました: {reason}"
+            ));
+        } else {
+            self.give_up_tool_name = name;
         }
         self
+    }
+
+    /// [`Self::with_give_up_tool_name`], but an unusable name is an error.
+    pub fn try_with_give_up_tool_name(
+        mut self,
+        name: impl Into<String>,
+    ) -> Result<Self, FillError> {
+        let name = name.into().trim().to_string();
+        if let Some(reason) = self.give_up_name_problem(&name) {
+            return Err(FillError::InvalidToolName { name, reason });
+        }
+        self.give_up_tool_name = name;
+        Ok(self)
+    }
+
+    fn give_up_name_problem(&self, name: &str) -> Option<String> {
+        if name.is_empty() {
+            return Some("空の名前は使えません".to_string());
+        }
+        if name == self.save_tool_name.as_str() {
+            return Some("保存ツール名と衝突しています".to_string());
+        }
+        if self.array_tool_names.all().contains(&name) {
+            return Some("配列ツール名と衝突しています".to_string());
+        }
+        None
     }
 
     pub fn give_up_tool_name(&self) -> &str {
@@ -367,25 +661,110 @@ where
         self
     }
 
+    /// The task text followed by every [`PromptSection::SYSTEM`] section.
+    ///
+    /// Built from the same rendering path as [`Self::prompt_section`], so the
+    /// two always agree.
     pub fn system_prompt(&self) -> String {
-        let mut out = build_system_prompt(
-            &self.prompt,
-            self.schema.root_kind(),
-            &self.save_tool_name,
-            &self.give_up_tool_name,
-            &self.array_tool_names,
-            &self.tools,
-        );
-        if self.schema_guide {
-            let fields = self.schema.guide_fields(&self.guide_options);
-            out.push_str(&guide_section(
-                self.schema.root_kind(),
-                &self.save_tool_name,
-                &self.array_tool_names,
-                &fields,
-            ));
+        let parts = self.prompt_parts();
+        let mut out = String::from(self.prompt.as_str());
+        for section in PromptSection::SYSTEM {
+            out.push_str(&self.section_text(section, &parts));
         }
         out
+    }
+
+    /// セッション開始時に user ロールで 1 回だけ送る文面。
+    ///
+    /// Object モードは [`Self::save_tool_name`] を、Array モードは
+    /// [`ArrayToolNames`] の 3 ツールを名指しする。Array モードでは
+    /// `save_result` がツール一覧に無いので、ここでも出さない。
+    /// どちらのモードでも [`Self::give_up_tool_name`] を含める。
+    pub fn start_message(&self) -> String {
+        let parts = self.prompt_parts();
+        self.section_text(PromptSection::StartMessage, &parts)
+    }
+
+    /// 調査を打ち切って保存に移る段階で 1 回だけ差し込む文面。
+    ///
+    /// Object モードは [`Self::save_tool_name`] を、Array モードは
+    /// [`ArrayToolNames`] の 3 ツールを名指しする。
+    pub fn save_only_message(&self) -> String {
+        let parts = self.prompt_parts();
+        self.section_text(PromptSection::SaveOnlyMessage, &parts)
+    }
+
+    /// Everything the prompt needs, borrowed from the session.
+    fn prompt_parts(&self) -> PromptParts<'_> {
+        // A replaced guide still needs the field list, whatever the mode says.
+        let needs_fields =
+            self.guide_mode != GuideMode::Off || self.overrides.has_template(PromptSection::Guide);
+        PromptParts {
+            save: &self.save_tool_name,
+            names: &self.array_tool_names,
+            give_up: &self.give_up_tool_name,
+            kind: self.schema.root_kind(),
+            guide: self.guide_mode,
+            fields: if needs_fields {
+                self.schema.guide_fields(&self.guide_options)
+            } else {
+                String::new()
+            },
+            hints: self.tool_hints(),
+        }
+    }
+
+    fn tool_hints(&self) -> String {
+        let mut hints: Vec<&str> = Vec::new();
+        for tool in self.tools.tools() {
+            if let Some(hint) = tool.prompt_hint() {
+                hints.push(hint);
+            }
+        }
+        hints.join("\n\n")
+    }
+
+    /// The text of one section, separators included.
+    fn section_text(&self, section: PromptSection, parts: &PromptParts<'_>) -> String {
+        if self.overrides.is_disabled(section) {
+            return String::new();
+        }
+        if let Some(template) = self.overrides.template(section) {
+            // `with_prompt_section` already rendered this template against the
+            // same mode, and the mode never changes afterwards. Falling back to
+            // an empty string keeps `system_prompt()` infallible.
+            return match substitute(template, section, parts) {
+                Ok(body) => crate::prompt::section_block(section, body),
+                Err(_) => String::new(),
+            };
+        }
+        render_section(section, parts)
+    }
+
+    fn section_view<'a>(
+        &'a self,
+        section: PromptSection,
+        parts: &PromptParts<'_>,
+    ) -> PromptSectionView<'a> {
+        if self.is_prompt_section_disabled(section) {
+            return PromptSectionView {
+                source: PromptSectionSource::Disabled,
+                template: None,
+                rendered: String::new(),
+            };
+        }
+        match self.overrides.template(section) {
+            Some(template) => PromptSectionView {
+                source: PromptSectionSource::Custom,
+                template: Some(template),
+                rendered: self.section_text(section, parts),
+            },
+            None => PromptSectionView {
+                source: PromptSectionSource::Default,
+                template: None,
+                rendered: self.section_text(section, parts),
+            },
+        }
     }
 
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
@@ -398,7 +777,11 @@ where
             RootKind::Array => crate::array::specs(&self.schema, &self.array_tool_names),
         };
         let mut reserved: Vec<String> = specs.iter().map(|spec| spec.name.clone()).collect();
-        reserved.push(self.save_tool_name.clone());
+        // Array モードで save 名を予約すると、同名の調査ツールがリクエストから
+        // 静かに消える（`call()` では実行できてしまう）。予約は Object モードだけ。
+        if !self.schema.is_array() {
+            reserved.push(self.save_tool_name.clone());
+        }
         let give_up_spec = give_up::spec(&self.give_up_tool_name);
         if !reserved.contains(&give_up_spec.name) {
             reserved.push(give_up_spec.name.clone());
@@ -532,6 +915,19 @@ where
             }
             if name == self.array_tool_names.remove {
                 return self.remove(args);
+            }
+            // 過去の履歴・癖・ファインチューニングで `save_result` を呼ぶ
+            // モデルは残る。同名の調査ツールが無いなら、その 1 ラウンドを
+            // 案内で回収する。
+            if name == self.save_tool_name && !self.tools.contains(name) {
+                let names = &self.array_tool_names;
+                return SessionResult::Continue {
+                    content: format!(
+                        "TOOL_ERROR: ツール '{name}' は Object モード専用のため、このモードでは利用できません。{} / {} / {} のいずれかで保存してください。",
+                        names.append, names.update, names.remove
+                    ),
+                    is_error: true,
+                };
             }
         } else if name == self.save_tool_name {
             return self.save(args);

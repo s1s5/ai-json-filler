@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use ai_json_filler_core::{BoxFuture, FillError, ToolOutput};
+use ai_json_filler_core::{
+    BoxFuture, ExtraKeys, FeedbackOptions, FillError, PromptSection, ToolOutput,
+};
 use ai_json_filler_genai::{ChatBackend, fill_with_backend};
 use genai::ModelIden;
 use genai::adapter::AdapterKind;
@@ -651,6 +653,17 @@ fn nudge_count(request: &ChatRequest) -> usize {
         .count()
 }
 
+fn conversation_text(request: &ChatRequest) -> String {
+    let mut text = String::new();
+    for message in &request.messages {
+        for chunk in message.content.texts() {
+            text.push_str(chunk);
+            text.push('\n');
+        }
+    }
+    text
+}
+
 fn lookup_tool() -> Tool {
     Tool::new(ToolName::Custom("lookup".to_string()))
         .with_description("調べる")
@@ -884,5 +897,249 @@ async fn builder_forwards_prompt_version() {
         .run()
         .await
         .expect("outcome");
-    assert_eq!(outcome.prompt_version, "save-contract-v3+stock-3");
+    assert_eq!(outcome.prompt_version, "save-contract-v4+stock-3");
+}
+
+#[tokio::test]
+async fn array_mode_start_message_names_array_tools() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "append",
+        json!({"items": [{"name": "A", "note": "n"}]}),
+    )])]));
+
+    fill_with_backend::<Vec<Row>>(backend.clone(), "調べて")
+        .run()
+        .await
+        .unwrap();
+
+    let text = conversation_text(&backend.requests()[0]);
+    for name in ["append", "update", "remove", "give_up"] {
+        assert!(text.contains(name), "missing {name}: {text}");
+    }
+    assert!(
+        !text.contains("save_result"),
+        "array mode must not point at save_result: {text}"
+    );
+}
+
+#[tokio::test]
+async fn array_mode_start_message_uses_custom_names() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "add_rows",
+        json!({"items": [{"name": "A", "note": "n"}]}),
+    )])]));
+
+    fill_with_backend::<Vec<Row>>(backend.clone(), "調べて")
+        .array_tool_names(ai_json_filler_core::ArrayToolNames {
+            append: "add_rows".to_string(),
+            update: "patch_row".to_string(),
+            remove: "drop_row".to_string(),
+        })
+        .run()
+        .await
+        .unwrap();
+
+    let text = conversation_text(&backend.requests()[0]);
+    for name in ["add_rows", "patch_row", "drop_row", "give_up"] {
+        assert!(text.contains(name), "missing {name}: {text}");
+    }
+    assert!(!text.contains("save_result"), "{text}");
+}
+
+#[tokio::test]
+async fn force_save_after_latches_after_text_turn() {
+    let backend = Arc::new(ScriptedBackend::new(vec![
+        response(vec![tool_call("1", "lookup", json!({}))]),
+        text_response("まだです"),
+        response(vec![tool_call("2", "lookup", json!({}))]),
+        response(vec![tool_call(
+            "3",
+            "save_result",
+            json!({"name": "x", "employees": 1}),
+        )]),
+    ]));
+
+    let outcome = fill_with_backend::<Company>(backend.clone(), "調べて")
+        .genai_tool(lookup_tool(), lookup_handler())
+        .force_save_after(1)
+        .max_turns(2)
+        .run()
+        .await;
+    assert!(outcome.is_ok(), "保存まで到達するはず");
+
+    let requests = backend.requests();
+    assert_eq!(requests.len(), 4);
+    let names = tool_names(&requests[2]);
+    assert!(
+        !names.iter().any(|name| name == "lookup"),
+        "a text turn must not bring investigation tools back: {names:?}"
+    );
+    assert_eq!(nudge_count(&requests[2]), 1, "the nudge is not repeated");
+}
+
+#[tokio::test]
+async fn array_names_win_over_save_name() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "store_fields",
+        json!({"items": [{"name": "A", "note": "n"}]}),
+    )])]));
+
+    let outcome = fill_with_backend::<Vec<Row>>(backend.clone(), "調べて")
+        .save_tool_name("store_fields")
+        .array_tool_names(ai_json_filler_core::ArrayToolNames {
+            append: "store_fields".to_string(),
+            update: "patch_row".to_string(),
+            remove: "drop_row".to_string(),
+        })
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(outcome.value.len(), 1);
+
+    let request = &backend.requests()[0];
+    let names = tool_names(request);
+    for expected in ["store_fields", "patch_row", "drop_row", "give_up"] {
+        assert!(names.iter().any(|name| name == expected), "{names:?}");
+    }
+    assert!(!names.iter().any(|name| name == "save_result"), "{names:?}");
+
+    // 開始メッセージも実際に使える配列名を指す。
+    let text = conversation_text(request);
+    assert!(
+        text.contains("store_fields / patch_row / drop_row"),
+        "{text}"
+    );
+}
+
+// --- プロンプト制御: セクション差し替え・監査・フィードバック設定 ---
+
+#[tokio::test]
+async fn feedback_options_reach_the_session() {
+    let backend = Arc::new(ScriptedBackend::new(vec![
+        response(vec![tool_call(
+            "1",
+            "save_result",
+            json!({"name": "トヨタ"}),
+        )]),
+        response(vec![tool_call(
+            "2",
+            "save_result",
+            json!({"employees": 370000}),
+        )]),
+    ]));
+
+    fill_with_backend::<Company>(backend.clone(), "調べて")
+        .feedback_options(FeedbackOptions {
+            max_errors: 0,
+            ..FeedbackOptions::default()
+        })
+        .run()
+        .await
+        .unwrap();
+
+    let mut feedback = String::new();
+    for message in &backend.requests()[1].messages {
+        for response in message.content.tool_responses() {
+            feedback.push_str(&response.content);
+            feedback.push('\n');
+        }
+    }
+    assert!(feedback.contains("…他 1 件"), "{feedback}");
+}
+
+#[tokio::test]
+async fn prompt_section_replaces_the_array_start_message() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "append",
+        json!({"items": [{"name": "A", "note": "n"}]}),
+    )])]));
+
+    fill_with_backend::<Vec<Row>>(backend.clone(), "調べて")
+        .prompt_section(
+            PromptSection::StartMessage,
+            "開始: {append} で追加し、無理なら {give_up} を呼ぶ",
+        )
+        .run()
+        .await
+        .unwrap();
+
+    let text = conversation_text(&backend.requests()[0]);
+    assert!(
+        text.contains("開始: append で追加し、無理なら give_up を呼ぶ"),
+        "{text}"
+    );
+    assert!(!text.contains("調査を開始し"), "{text}");
+}
+
+#[tokio::test]
+async fn prompt_audit_warnings_land_in_the_outcome() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "save_result",
+        json!({"name": "x", "employees": 1, "bogus": true}),
+    )])]));
+
+    let outcome = fill_with_backend::<Company>(backend, "調べて")
+        .extra_keys(ExtraKeys::Strip)
+        .prompt_section(PromptSection::StartMessage, "調査してください")
+        .run()
+        .await
+        .unwrap();
+
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("開始メッセージ")),
+        "audit warning missing: {:?}",
+        outcome.warnings
+    );
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("bogus")),
+        "existing warning missing: {:?}",
+        outcome.warnings
+    );
+}
+
+#[tokio::test]
+async fn invalid_prompt_section_fails_at_run() {
+    let backend = Arc::new(ScriptedBackend::new(vec![]));
+
+    let error = match fill_with_backend::<Company>(backend, "調べて")
+        .prompt_section(PromptSection::StartMessage, "{append}")
+        .run()
+        .await
+    {
+        Ok(_) => panic!("object mode has no append tool"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, FillError::UnknownPromptPlaceholder { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn strict_tool_name_is_an_error_at_run() {
+    let backend = Arc::new(ScriptedBackend::new(vec![]));
+
+    let error = match fill_with_backend::<Company>(backend, "調べて")
+        .try_give_up_tool_name("save_result")
+        .run()
+        .await
+    {
+        Ok(_) => panic!("the name collides with the save tool"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, FillError::InvalidToolName { .. }),
+        "{error:?}"
+    );
 }

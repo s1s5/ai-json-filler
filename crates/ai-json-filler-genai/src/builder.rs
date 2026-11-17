@@ -2,8 +2,8 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use ai_json_filler_core::{
-    ArrayToolNames, BoxFuture, ExtraKeys, FillError, FillOutcome, FillSession, GoalEmpty,
-    GuideOptions, SessionResult, Tool, ToolOutput, ToolSpec,
+    ArrayToolNames, BoxFuture, ExtraKeys, FeedbackOptions, FillError, FillOutcome, FillSession,
+    GoalEmpty, GuideMode, GuideOptions, PromptSection, SessionResult, Tool, ToolOutput, ToolSpec,
 };
 use genai::chat::{ChatMessage, ChatRequest, ContentPart, MessageContent, ToolResponse};
 use schemars::JsonSchema;
@@ -54,11 +54,16 @@ where
         save_tool_name: None,
         give_up_tool_name: None,
         array_tool_names: None,
+        strict_tool_names: false,
         goal_fields: Vec::new(),
         goal_empty: None,
         extra_keys: None,
         schema_guide: None,
+        guide_mode: None,
         guide_options: None,
+        feedback_options: None,
+        prompt_sections: Vec::new(),
+        disabled_sections: Vec::new(),
         tool_budgets: Vec::new(),
         prompt_version: None,
         force_save_after: None,
@@ -81,11 +86,18 @@ pub struct GenaiFillBuilder<T> {
     save_tool_name: Option<String>,
     give_up_tool_name: Option<String>,
     array_tool_names: Option<ArrayToolNames>,
+    /// Set by the `try_*` name setters: a name that cannot be applied is then
+    /// an error instead of a warning.
+    strict_tool_names: bool,
     goal_fields: Vec<String>,
     goal_empty: Option<GoalEmpty>,
     extra_keys: Option<ExtraKeys>,
     schema_guide: Option<bool>,
+    guide_mode: Option<GuideMode>,
     guide_options: Option<GuideOptions>,
+    feedback_options: Option<FeedbackOptions>,
+    prompt_sections: Vec<(PromptSection, String)>,
+    disabled_sections: Vec<PromptSection>,
     tool_budgets: Vec<(String, usize)>,
     prompt_version: Option<String>,
     force_save_after: Option<usize>,
@@ -152,7 +164,20 @@ where
     }
 
     /// Override the name of the tool used for partial saves (default: `save_result`).
+    ///
+    /// Unused in array mode: the advertised tools and the loop's start message
+    /// come from [`ArrayToolNames`] there. When the name collides with one of
+    /// the array tool names, the array names win in array mode (they are
+    /// applied first) and this name is ignored.
     pub fn save_tool_name(mut self, name: impl Into<String>) -> Self {
+        self.save_tool_name = Some(name.into());
+        self
+    }
+
+    /// [`Self::save_tool_name`], but a name that cannot be used is an error
+    /// when [`Self::run`] starts instead of a warning.
+    pub fn try_save_tool_name(mut self, name: impl Into<String>) -> Self {
+        self.strict_tool_names = true;
         self.save_tool_name = Some(name.into());
         self
     }
@@ -164,8 +189,24 @@ where
         self
     }
 
+    /// [`Self::give_up_tool_name`], with strict validation (see
+    /// [`Self::try_save_tool_name`]).
+    pub fn try_give_up_tool_name(mut self, name: impl Into<String>) -> Self {
+        self.strict_tool_names = true;
+        self.give_up_tool_name = Some(name.into());
+        self
+    }
+
     /// Override the names of the three tools used in array mode.
     pub fn array_tool_names(mut self, names: ArrayToolNames) -> Self {
+        self.array_tool_names = Some(names);
+        self
+    }
+
+    /// [`Self::array_tool_names`], with strict validation (see
+    /// [`Self::try_save_tool_name`]).
+    pub fn try_array_tool_names(mut self, names: ArrayToolNames) -> Self {
+        self.strict_tool_names = true;
         self.array_tool_names = Some(names);
         self
     }
@@ -201,9 +242,44 @@ where
         self
     }
 
+    /// How much of the field list the system prompt carries
+    /// (default: [`GuideMode::FieldsWithToolNames`]).
+    ///
+    /// [`GuideMode::Fields`] keeps the list but drops the sentence that names
+    /// the save tools.
+    pub fn guide_mode(mut self, mode: GuideMode) -> Self {
+        self.guide_mode = Some(mode);
+        self
+    }
+
     /// Tune how much of each field's doc comment the guide includes.
     pub fn guide_options(mut self, options: GuideOptions) -> Self {
         self.guide_options = Some(options);
+        self
+    }
+
+    /// Limits for the validation feedback the model gets after a failed save.
+    pub fn feedback_options(mut self, options: FeedbackOptions) -> Self {
+        self.feedback_options = Some(options);
+        self
+    }
+
+    /// Replace the text of one prompt section.
+    ///
+    /// Placeholders (`{save}`, `{append}`, `{update}`, `{remove}`, `{give_up}`,
+    /// and `{fields}` in the guide) are filled from the current settings, so
+    /// the template does not have to know the mode. They are checked when
+    /// [`Self::run`] builds the session, because the mode comes from the type
+    /// parameter.
+    pub fn prompt_section(mut self, section: PromptSection, template: impl Into<String>) -> Self {
+        self.prompt_sections.push((section, template.into()));
+        self
+    }
+
+    /// Drop a prompt section. A section that was also replaced by
+    /// [`Self::prompt_section`] is dropped, because this is applied last.
+    pub fn without_prompt_section(mut self, section: PromptSection) -> Self {
+        self.disabled_sections.push(section);
         self
     }
 
@@ -216,7 +292,7 @@ where
     }
 
     /// 呼び出し側のプロンプト版を連結する（例: `"stock-3"` →
-    /// `"save-contract-v3+stock-3"`）。空文字・空白のみは無視される。
+    /// `"save-contract-v4+stock-3"`）。空文字・空白のみは無視される。
     ///
     /// 連結結果は [`FillOutcome::prompt_version`] から読める。
     pub fn prompt_version(mut self, suffix: impl Into<String>) -> Self {
@@ -244,14 +320,46 @@ where
             Some(seed) => FillSession::<T>::with_seed(self.prompt, seed)?,
             None => FillSession::<T>::new(self.prompt)?,
         };
-        if let Some(name) = self.save_tool_name {
-            session = session.with_save_tool_name(name);
+        // 名前の衝突は「後から適用した側が無視される」。Array モードで実際に
+        // 使われるのは配列名なので、先に適用して勝たせる。
+        let strict = self.strict_tool_names;
+        if session.is_array() {
+            if let Some(names) = self.array_tool_names {
+                session = if strict {
+                    session.try_with_array_tool_names(names)?
+                } else {
+                    session.with_array_tool_names(names)
+                };
+            }
+            if let Some(name) = self.save_tool_name {
+                session = if strict {
+                    session.try_with_save_tool_name(name)?
+                } else {
+                    session.with_save_tool_name(name)
+                };
+            }
+        } else {
+            if let Some(name) = self.save_tool_name {
+                session = if strict {
+                    session.try_with_save_tool_name(name)?
+                } else {
+                    session.with_save_tool_name(name)
+                };
+            }
+            if let Some(names) = self.array_tool_names {
+                session = if strict {
+                    session.try_with_array_tool_names(names)?
+                } else {
+                    session.with_array_tool_names(names)
+                };
+            }
         }
         if let Some(name) = self.give_up_tool_name {
-            session = session.with_give_up_tool_name(name);
-        }
-        if let Some(names) = self.array_tool_names {
-            session = session.with_array_tool_names(names);
+            session = if strict {
+                session.try_with_give_up_tool_name(name)?
+            } else {
+                session.with_give_up_tool_name(name)
+            };
         }
         if !self.goal_fields.is_empty() {
             session = session.with_goal_fields(self.goal_fields)?;
@@ -265,8 +373,20 @@ where
         if let Some(enabled) = self.schema_guide {
             session = session.with_schema_guide(enabled);
         }
+        if let Some(mode) = self.guide_mode {
+            session = session.with_guide_mode(mode);
+        }
         if let Some(options) = self.guide_options {
             session = session.with_guide_options(options);
+        }
+        if let Some(options) = self.feedback_options {
+            session = session.with_feedback_options(options);
+        }
+        for (section, template) in self.prompt_sections {
+            session = session.with_prompt_section(section, template)?;
+        }
+        for section in self.disabled_sections {
+            session = session.without_prompt_section(section);
         }
         for (tool, max) in self.tool_budgets {
             session = session.with_tool_budget(tool, max);
@@ -277,34 +397,25 @@ where
         for tool in self.tools {
             session.add_tool(tool);
         }
-        let save_tool_name = session.save_tool_name().to_string();
-        let give_up_tool_name = session.give_up_tool_name().to_string();
-
-        let mut messages: Vec<ChatMessage> = vec![ChatMessage::user(format!(
-            "調査を開始し、{save_tool_name} ツールで結果を保存してください。調べても分からない場合は {give_up_tool_name} を呼んでください"
-        ))];
-        let force_save_message = if session.is_array() {
-            let names = session.array_tool_names();
-            format!(
-                "これ以上は調査できません。分かった範囲で {} / {} / {} のいずれかで保存してください。\n分からない項目は {} で報告してください。",
-                names.append, names.update, names.remove, give_up_tool_name
-            )
-        } else {
-            format!(
-                "これ以上は調査できません。分かった範囲で {save_tool_name} を呼んでください。\n分からない項目は {give_up_tool_name} で報告してください。"
-            )
-        };
+        // 監査は登録済みのツール名も見るので、ツール追加の後に行う。
+        session = session.with_prompt_audit();
+        let mut messages: Vec<ChatMessage> = vec![ChatMessage::user(session.start_message())];
+        let force_save_message = session.save_only_message();
 
         let mut turns = 0usize;
         let mut rounds = 0usize;
         let mut nudged = false;
+        // 閾値到達をラッチする。ツール無し応答で `rounds` は 0 に戻るので、
+        // 毎周計算し直すと調査ツールと allowlist が復活してしまう。
+        let mut forced = false;
 
         loop {
             if turns >= max_turns {
                 break;
             }
 
-            let forcing = force_save_after.is_some_and(|threshold| rounds >= threshold);
+            let forcing = forced || force_save_after.is_some_and(|threshold| rounds >= threshold);
+            forced = forcing;
             if forcing && !nudged {
                 messages.push(ChatMessage::user(force_save_message.clone()));
                 nudged = true;

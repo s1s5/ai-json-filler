@@ -102,7 +102,7 @@ impl FillSchema {
     ///
     /// Only the list itself is returned (`- name: string  (必須)  会社名`);
     /// the heading and the preamble around it are built by
-    /// `prompt::guide_section`. An empty string means "nothing to render",
+    /// `prompt::guide_body`. An empty string means "nothing to render",
     /// so the caller does not leave an empty heading behind.
     ///
     /// Odd schemas never panic here: what can be written is written, and an

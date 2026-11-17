@@ -139,6 +139,8 @@ fn next_action(
     indices.dedup();
 
     if !element {
+        // Object モード専用。Array モードではゴール記法が構築時に検証される
+        // ため、要素のゴールが無い `GoalMiss::Field` はここに来ない。
         if truncated || fields.len() > 3 {
             return format!("{save_tool_name} に不足している項目を入れて再送してください。");
         }

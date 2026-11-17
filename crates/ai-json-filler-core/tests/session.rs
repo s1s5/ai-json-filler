@@ -3,8 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ai_json_filler_core::{
-    BoxFuture, ExtraKeys, FeedbackOptions, FillError, FillSession, GoalEmpty, GuideOptions,
-    PROMPT_VERSION, SessionResult, Tool, ToolOutput, ToolSpec,
+    BoxFuture, ExtraKeys, FeedbackOptions, FillError, FillSession, GoalEmpty, GuideMode,
+    GuideOptions, PROMPT_VERSION, PromptSection, PromptSectionSource, SessionResult, Tool,
+    ToolOutput, ToolSpec,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -887,6 +888,11 @@ async fn array_mode_rejects_save_result() {
         SessionResult::Continue { content, is_error } => {
             assert!(is_error);
             assert!(content.contains("利用できません"), "{content}");
+            assert!(content.contains("Object モード"), "{content}");
+            assert!(
+                content.contains("append / update / remove のいずれかで保存"),
+                "{content}"
+            );
         }
         other => {
             let _ = other;
@@ -1667,7 +1673,7 @@ async fn outcome_reports_default_prompt_version() {
 #[tokio::test]
 async fn prompt_version_suffix_is_appended() {
     let mut session = new_session().with_prompt_version("stock-3");
-    assert_eq!(session.prompt_version(), "save-contract-v3+stock-3");
+    assert_eq!(session.prompt_version(), "save-contract-v4+stock-3");
 
     assert!(matches!(
         session
@@ -1680,7 +1686,7 @@ async fn prompt_version_suffix_is_appended() {
     ));
 
     let outcome = session.into_outcome().expect("outcome");
-    assert_eq!(outcome.prompt_version, "save-contract-v3+stock-3");
+    assert_eq!(outcome.prompt_version, "save-contract-v4+stock-3");
 }
 
 #[tokio::test]
@@ -1693,4 +1699,607 @@ async fn blank_prompt_version_suffix_is_ignored() {
             "suffix {suffix:?} must be ignored"
         );
     }
+}
+
+// --- 修正 08: 開始メッセージ・強制保存メッセージを core に移す ---
+
+#[test]
+fn start_message_names_save_tool_in_object_mode() {
+    let message = new_session().start_message();
+    assert!(message.contains("save_result"), "{message}");
+    assert!(message.contains("give_up"), "{message}");
+    assert!(message.contains("調査を開始し"), "{message}");
+    assert!(!message.contains("append"), "{message}");
+    assert!(!message.contains("update"), "{message}");
+}
+
+#[test]
+fn start_message_names_array_tools_in_array_mode() {
+    let message = array_session().start_message();
+    for name in ["append", "update", "remove", "give_up"] {
+        assert!(message.contains(name), "missing {name}: {message}");
+    }
+    assert!(!message.contains("save_result"), "{message}");
+}
+
+#[test]
+fn start_message_uses_custom_names() {
+    let object = new_session()
+        .with_save_tool_name("store_fields")
+        .with_give_up_tool_name("cannot_complete")
+        .start_message();
+    assert!(object.contains("store_fields"), "{object}");
+    assert!(object.contains("cannot_complete"), "{object}");
+    assert!(!object.contains("save_result"), "{object}");
+    assert!(!object.contains("give_up"), "{object}");
+
+    let array = array_session()
+        .with_array_tool_names(ai_json_filler_core::ArrayToolNames {
+            append: "add_rows".to_string(),
+            update: "patch_row".to_string(),
+            remove: "drop_row".to_string(),
+        })
+        .with_give_up_tool_name("cannot_complete")
+        .start_message();
+    for name in ["add_rows", "patch_row", "drop_row", "cannot_complete"] {
+        assert!(array.contains(name), "missing {name}: {array}");
+    }
+    assert!(!array.contains("save_result"), "{array}");
+}
+
+#[test]
+fn save_only_message_follows_the_mode() {
+    let object = new_session().save_only_message();
+    assert!(object.contains("これ以上は調査できません"), "{object}");
+    assert!(object.contains("save_result を呼んでください"), "{object}");
+    assert!(object.contains("give_up で報告"), "{object}");
+    assert!(!object.contains("append"), "{object}");
+
+    let array = array_session().save_only_message();
+    assert!(array.contains("これ以上は調査できません"), "{array}");
+    assert!(
+        array.contains("append / update / remove のいずれかで保存してください"),
+        "{array}"
+    );
+    assert!(array.contains("give_up で報告"), "{array}");
+    assert!(!array.contains("save_result"), "{array}");
+
+    let custom = array_session()
+        .with_array_tool_names(ai_json_filler_core::ArrayToolNames {
+            append: "add_rows".to_string(),
+            update: "patch_row".to_string(),
+            remove: "drop_row".to_string(),
+        })
+        .with_give_up_tool_name("cannot_complete")
+        .save_only_message();
+    assert!(
+        custom.contains("add_rows / patch_row / drop_row のいずれかで保存してください"),
+        "{custom}"
+    );
+    assert!(custom.contains("cannot_complete で報告"), "{custom}");
+    assert!(!custom.contains("save_result"), "{custom}");
+}
+
+#[tokio::test]
+async fn array_mode_advertises_investigation_tool_named_like_save_tool() {
+    let mut session = array_session();
+    session.add_tool(Arc::new(CountingTool::new("save_result")));
+
+    let names: Vec<String> = session
+        .tool_specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect();
+    assert!(names.iter().any(|name| name == "save_result"), "{names:?}");
+    // 配列ツールと give_up はそのまま残る。
+    for expected in ["append", "update", "remove", "give_up"] {
+        assert!(names.iter().any(|name| name == expected), "{names:?}");
+    }
+
+    // 同名の調査ツールは実行できる（案内に横取りされない）。
+    match session.call("save_result", json!({})).await {
+        SessionResult::Continue { content, is_error } => {
+            assert!(!is_error, "{content}");
+            assert!(content.contains("調査しました"), "{content}");
+        }
+        _ => panic!("registered investigation tool must run"),
+    }
+}
+
+// --- プロンプト制御: セクション差し替え・無効化・監査 ---
+
+#[test]
+fn prompt_section_override_replaces_only_that_section() {
+    let prompt = new_session()
+        .with_prompt_section(
+            PromptSection::LanguageRules,
+            "【言語】\n- 必ず英語で書くこと",
+        )
+        .expect("section")
+        .system_prompt();
+
+    assert!(prompt.contains("【保存の手順】"), "{prompt}");
+    assert!(prompt.contains("必ず英語で書くこと"), "{prompt}");
+    assert!(!prompt.contains("中国語（簡体字）"), "{prompt}");
+    assert!(prompt.contains("【保存する JSON の形】"), "{prompt}");
+}
+
+#[test]
+fn prompt_section_placeholders_follow_the_mode() {
+    let object = new_session()
+        .with_prompt_section(
+            PromptSection::StartMessage,
+            "{save} で保存し、無理なら {give_up} を呼んでください",
+        )
+        .expect("section");
+    assert_eq!(
+        object.start_message(),
+        "save_result で保存し、無理なら give_up を呼んでください"
+    );
+
+    let array = array_session()
+        .with_array_tool_names(ai_json_filler_core::ArrayToolNames {
+            append: "add_rows".to_string(),
+            update: "patch_row".to_string(),
+            remove: "drop_row".to_string(),
+        })
+        .with_prompt_section(
+            PromptSection::StartMessage,
+            "{append} / {update} / {remove} か {give_up}",
+        )
+        .expect("section");
+    assert_eq!(
+        array.start_message(),
+        "add_rows / patch_row / drop_row か give_up"
+    );
+}
+
+#[test]
+fn prompt_section_rejects_foreign_mode_placeholder() {
+    let object = new_session()
+        .with_prompt_section(PromptSection::StartMessage, "{append}")
+        .err()
+        .expect("object mode has no append tool");
+    assert!(
+        matches!(
+            object,
+            FillError::UnknownPromptPlaceholder {
+                section: PromptSection::StartMessage,
+                ..
+            }
+        ),
+        "{object:?}"
+    );
+
+    let array = array_session()
+        .with_prompt_section(PromptSection::StartMessage, "{save}")
+        .err()
+        .expect("array mode has no save tool");
+    assert!(matches!(array, FillError::UnknownPromptPlaceholder { .. }));
+}
+
+#[test]
+fn prompt_section_rejects_unknown_placeholder() {
+    let error = new_session()
+        .with_prompt_section(PromptSection::StartMessage, "{savee}")
+        .err()
+        .expect("typo");
+    assert!(
+        matches!(
+            error,
+            FillError::UnknownPromptPlaceholder { ref placeholder, .. } if placeholder == "{savee}"
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn guide_section_requires_fields_placeholder() {
+    let error = new_session()
+        .with_prompt_section(PromptSection::Guide, "【保存する形】だけ")
+        .err()
+        .expect("field list would silently disappear");
+    assert!(matches!(
+        error,
+        FillError::MissingFieldsPlaceholder {
+            section: PromptSection::Guide
+        }
+    ));
+
+    let guide = new_session()
+        .with_prompt_section(PromptSection::Guide, "【保存する形】\n{fields}")
+        .expect("guide with fields")
+        .prompt_section(PromptSection::Guide)
+        .rendered;
+    assert!(guide.contains("【保存する形】"), "{guide}");
+    assert!(guide.contains("- name: string"), "{guide}");
+    assert!(!guide.contains("{fields}"), "{guide}");
+}
+
+#[test]
+fn without_prompt_section_removes_language_rules() {
+    let session = new_session().without_prompt_section(PromptSection::LanguageRules);
+    let prompt = session.system_prompt();
+    assert!(!prompt.contains("【言語】"), "{prompt}");
+    assert!(!prompt.contains("中国語（簡体字）"), "{prompt}");
+    assert!(prompt.contains("【保存の手順】"), "{prompt}");
+    assert!(session.is_prompt_section_disabled(PromptSection::LanguageRules));
+    assert!(!session.is_prompt_section_disabled(PromptSection::Guide));
+}
+
+#[test]
+fn reset_prompt_section_restores_the_default_text() {
+    let session = new_session()
+        .without_prompt_section(PromptSection::LanguageRules)
+        .reset_prompt_section(PromptSection::LanguageRules);
+    assert!(session.system_prompt().contains("【言語】"));
+    assert_eq!(
+        session.prompt_section(PromptSection::LanguageRules).source,
+        PromptSectionSource::Default
+    );
+}
+
+#[test]
+fn guide_mode_fields_keeps_the_list_and_drops_tool_names() {
+    let guide = new_session()
+        .with_guide_mode(GuideMode::Fields)
+        .prompt_section(PromptSection::Guide)
+        .rendered;
+    assert!(guide.contains("【保存する JSON の形】"), "{guide}");
+    assert!(guide.contains("- name: string  (必須)"), "{guide}");
+    assert!(!guide.contains("save_result"), "{guide}");
+
+    let guide = array_session()
+        .with_guide_mode(GuideMode::Fields)
+        .prompt_section(PromptSection::Guide)
+        .rendered;
+    assert!(guide.contains("【要素の形】"), "{guide}");
+    assert!(guide.contains("- name: string  (必須)"), "{guide}");
+    for name in ["append", "update", "remove"] {
+        assert!(!guide.contains(name), "{name} leaked: {guide}");
+    }
+}
+
+#[test]
+fn guide_mode_off_matches_with_schema_guide_false() {
+    let off = new_session()
+        .with_guide_mode(GuideMode::Off)
+        .system_prompt();
+    let legacy = new_session().with_schema_guide(false).system_prompt();
+    assert_eq!(off, legacy);
+    assert!(!off.contains("【保存する JSON の形】"), "{off}");
+
+    // 明示的に差し替えた Guide はモードより優先される。
+    let custom = new_session()
+        .with_guide_mode(GuideMode::Off)
+        .with_prompt_section(PromptSection::Guide, "【形】\n{fields}")
+        .expect("guide");
+    assert!(
+        custom.system_prompt().contains("【形】"),
+        "{}",
+        custom.system_prompt()
+    );
+}
+
+#[test]
+fn prompt_audit_is_clean_by_default() {
+    assert!(
+        new_session().prompt_audit().warnings.is_empty(),
+        "{:?}",
+        new_session().prompt_audit().warnings
+    );
+    assert!(
+        array_session().prompt_audit().warnings.is_empty(),
+        "{:?}",
+        array_session().prompt_audit().warnings
+    );
+}
+
+#[test]
+fn prompt_audit_flags_save_result_in_array_mode() {
+    let session = array_session()
+        .with_prompt_section(
+            PromptSection::StartMessage,
+            "save_result で保存してください",
+        )
+        .expect("literal name is allowed");
+    let audit = session.prompt_audit();
+    assert!(
+        audit.warnings.iter().any(|w| w.contains("save_result")),
+        "{:?}",
+        audit.warnings
+    );
+}
+
+#[test]
+fn prompt_audit_flags_explicit_save_name_in_array_mode() {
+    let session = array_session().with_save_tool_name("store_fields");
+    let audit = session.prompt_audit();
+    assert!(
+        audit
+            .warnings
+            .iter()
+            .any(|w| w.contains("store_fields") && w.contains("配列モード")),
+        "{:?}",
+        audit.warnings
+    );
+}
+
+#[test]
+fn prompt_audit_allow_suppresses_named_warnings() {
+    let session = array_session()
+        .with_prompt_section(PromptSection::StartMessage, "save_result で保存")
+        .expect("literal name");
+    let audit = session.prompt_audit();
+    assert!(!audit.warnings.is_empty(), "precondition");
+    let allowed = audit.allow("save_result");
+    assert!(
+        allowed.warnings.iter().all(|w| !w.contains("save_result")),
+        "{:?}",
+        allowed.warnings
+    );
+}
+
+#[test]
+fn prompt_audit_merges_into_warnings() {
+    let session = array_session()
+        .with_prompt_section(PromptSection::StartMessage, "save_result で保存")
+        .expect("literal name");
+    assert!(session.warnings().is_empty(), "audit has not run yet");
+    let session = session.with_prompt_audit();
+    assert!(
+        session.warnings().iter().any(|w| w.contains("save_result")),
+        "{:?}",
+        session.warnings()
+    );
+}
+
+#[test]
+fn ignored_tool_name_adds_one_warning() {
+    let session = new_session().with_give_up_tool_name("save_result");
+    assert_eq!(session.warnings().len(), 1, "{:?}", session.warnings());
+    assert!(
+        session.warnings()[0].contains("save_result"),
+        "{:?}",
+        session.warnings()
+    );
+    assert_eq!(session.give_up_tool_name(), "give_up");
+
+    let session = array_session().with_save_tool_name("append");
+    assert_eq!(session.warnings().len(), 1, "{:?}", session.warnings());
+    assert!(
+        session.warnings()[0].contains("append"),
+        "{:?}",
+        session.warnings()
+    );
+    assert_eq!(session.save_tool_name(), "save_result");
+}
+
+#[test]
+fn try_with_tool_name_errors_instead_of_ignoring() {
+    assert!(matches!(
+        new_session().try_with_give_up_tool_name("save_result"),
+        Err(FillError::InvalidToolName { .. })
+    ));
+    assert!(matches!(
+        new_session().try_with_save_tool_name("   "),
+        Err(FillError::InvalidToolName { .. })
+    ));
+    let session = new_session()
+        .try_with_save_tool_name("store_fields")
+        .expect("free name");
+    assert_eq!(session.save_tool_name(), "store_fields");
+
+    let names = ai_json_filler_core::ArrayToolNames {
+        append: "same".to_string(),
+        update: "same".to_string(),
+        remove: "drop".to_string(),
+    };
+    assert!(matches!(
+        array_session().try_with_array_tool_names(names),
+        Err(FillError::InvalidToolName { .. })
+    ));
+}
+
+#[test]
+fn prompt_getter_returns_the_task_text() {
+    assert_eq!(new_session().prompt(), "会社情報を調べて");
+}
+
+#[test]
+fn prompt_section_view_reports_default() {
+    let session = new_session();
+    let view = session.prompt_section(PromptSection::LanguageRules);
+    assert_eq!(view.source, PromptSectionSource::Default);
+    assert!(view.template.is_none());
+    assert!(view.rendered.contains("【言語】"), "{}", view.rendered);
+}
+
+#[test]
+fn prompt_section_view_reports_custom_and_keeps_raw_template() {
+    let session = new_session()
+        .with_prompt_section(
+            PromptSection::StartMessage,
+            "{save} で始めて、{give_up} で諦めて",
+        )
+        .expect("section");
+    let view = session.prompt_section(PromptSection::StartMessage);
+    assert_eq!(view.source, PromptSectionSource::Custom);
+    assert_eq!(view.template, Some("{save} で始めて、{give_up} で諦めて"));
+    assert_eq!(view.rendered, "save_result で始めて、give_up で諦めて");
+}
+
+#[test]
+fn prompt_section_view_reports_disabled() {
+    let session = new_session().without_prompt_section(PromptSection::LanguageRules);
+    let view = session.prompt_section(PromptSection::LanguageRules);
+    assert_eq!(view.source, PromptSectionSource::Disabled);
+    assert!(view.template.is_none());
+    assert!(view.rendered.is_empty(), "{}", view.rendered);
+}
+
+#[test]
+fn prompt_sections_returns_six_in_fixed_order() {
+    let session = new_session();
+    let sections = session.prompt_sections();
+    let order: Vec<PromptSection> = sections.iter().map(|(section, _)| *section).collect();
+    assert_eq!(order, PromptSection::ALL.to_vec());
+
+    let rendered: Vec<String> = sections
+        .into_iter()
+        .map(|(_, view)| view.rendered)
+        .collect();
+    assert!(rendered[0].contains("【保存の手順】"), "{}", rendered[0]);
+    assert!(rendered[4].contains("調査を開始し"), "{}", rendered[4]);
+    assert!(
+        rendered[5].contains("これ以上は調査できません"),
+        "{}",
+        rendered[5]
+    );
+    assert!(rendered[3].is_empty(), "no tool hints registered");
+}
+
+#[test]
+fn rendered_sections_join_into_the_system_prompt() {
+    let session = new_session()
+        .with_prompt_section(PromptSection::Guide, "【保存する形】\n{fields}")
+        .expect("guide");
+    let joined: String = session
+        .prompt_sections()
+        .iter()
+        .filter(|(section, _)| PromptSection::SYSTEM.contains(section))
+        .map(|(_, view)| view.rendered.as_str())
+        .collect();
+    assert_eq!(
+        format!("{}{}", session.prompt(), joined),
+        session.system_prompt()
+    );
+
+    assert_eq!(
+        session.prompt_section(PromptSection::StartMessage).rendered,
+        session.start_message()
+    );
+    assert_eq!(
+        session
+            .prompt_section(PromptSection::SaveOnlyMessage)
+            .rendered,
+        session.save_only_message()
+    );
+}
+
+#[test]
+fn rendered_section_follows_later_tool_renames() {
+    let session = new_session()
+        .with_prompt_section(PromptSection::StartMessage, "{save} で保存")
+        .expect("section");
+    assert!(
+        session
+            .prompt_section(PromptSection::StartMessage)
+            .rendered
+            .contains("save_result")
+    );
+
+    let session = session.with_save_tool_name("store_fields");
+    let view = session.prompt_section(PromptSection::StartMessage);
+    assert!(view.rendered.contains("store_fields"), "{}", view.rendered);
+    assert!(!view.rendered.contains("save_result"), "{}", view.rendered);
+    assert_eq!(view.template, Some("{save} で保存"));
+}
+
+struct HintedTool;
+
+impl Tool for HintedTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "hinted".to_string(),
+            description: "ヒント付きの調査ツール".to_string(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn prompt_hint(&self) -> Option<&'static str> {
+        Some("【補足】hinted は合計3回まで")
+    }
+
+    fn call<'a>(&'a self, _args: Value) -> BoxFuture<'a, Result<ToolOutput, FillError>> {
+        Box::pin(async move { Ok(ToolOutput::success("調査しました")) })
+    }
+}
+
+#[test]
+fn without_tool_hints_drops_every_hint() {
+    let mut session = new_session();
+    session.add_tool(Arc::new(HintedTool));
+
+    let view = session.prompt_section(PromptSection::ToolHints);
+    assert_eq!(view.source, PromptSectionSource::Default);
+    assert!(view.rendered.contains("【補足】"), "{}", view.rendered);
+    assert!(session.system_prompt().contains("【補足】"));
+
+    let session = session.without_prompt_section(PromptSection::ToolHints);
+    assert!(
+        session
+            .prompt_section(PromptSection::ToolHints)
+            .rendered
+            .is_empty()
+    );
+    assert!(!session.system_prompt().contains("【補足】"));
+    assert!(session.system_prompt().contains("【言語】"));
+}
+
+#[test]
+fn prompt_section_allows_json_examples() {
+    let template = r#"例: {"name": "x"} のように保存する。{save} を呼ぶ"#;
+    let session = new_session()
+        .with_prompt_section(PromptSection::SaveInstructions, template)
+        .expect("JSON example must not look like a placeholder");
+
+    let view = session.prompt_section(PromptSection::SaveInstructions);
+    assert_eq!(view.template, Some(template));
+    assert!(
+        view.rendered.contains(r#"{"name": "x"}"#),
+        "{}",
+        view.rendered
+    );
+    assert!(
+        view.rendered.contains("save_result を呼ぶ"),
+        "{}",
+        view.rendered
+    );
+    assert_eq!(view.source, PromptSectionSource::Custom);
+    assert!(session.system_prompt().contains(r#"{"name": "x"}"#));
+}
+
+#[test]
+fn prompt_section_trims_placeholder_whitespace() {
+    let session = new_session()
+        .with_prompt_section(
+            PromptSection::StartMessage,
+            "{ save } で保存し、無理なら { give_up } を呼ぶ",
+        )
+        .expect("spacing inside braces is tolerated");
+    assert_eq!(
+        session.start_message(),
+        "save_result で保存し、無理なら give_up を呼ぶ"
+    );
+}
+
+#[test]
+fn prompt_section_treats_uppercase_as_literal() {
+    let session = new_session()
+        .with_prompt_section(PromptSection::StartMessage, "{Save} で保存する")
+        .expect("not identifier-shaped, so literal");
+    assert_eq!(session.start_message(), "{Save} で保存する");
+}
+
+#[test]
+fn guide_template_accepts_spaced_fields() {
+    let guide = new_session()
+        .with_prompt_section(PromptSection::Guide, "【形】\n{ fields }")
+        .expect("{ fields } is the fields placeholder")
+        .prompt_section(PromptSection::Guide)
+        .rendered;
+    assert!(guide.contains("【形】"), "{guide}");
+    assert!(guide.contains("- name: string  (必須)"), "{guide}");
+    assert!(!guide.contains("{ fields }"), "{guide}");
 }

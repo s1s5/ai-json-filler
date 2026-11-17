@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+use crate::prompt::PromptSection;
 use crate::validation::ValidationIssue;
 
 #[derive(Debug, thiserror::Error)]
@@ -14,6 +15,15 @@ pub enum FillError {
     InvalidSeed { issues: Vec<ValidationIssue> },
     #[error("invalid goal path: {path}（`field` または `[].field` の形で指定してください）")]
     InvalidGoalPath { path: String },
+    #[error("unknown or unavailable prompt placeholder {placeholder} in section '{section}'")]
+    UnknownPromptPlaceholder {
+        section: PromptSection,
+        placeholder: String,
+    },
+    #[error("prompt section '{section}' must contain {{fields}}")]
+    MissingFieldsPlaceholder { section: PromptSection },
+    #[error("tool name '{name}' is not usable: {reason}")]
+    InvalidToolName { name: String, reason: String },
     #[error("unknown goal field: {path}（スキーマに存在しません）")]
     UnknownGoalField { path: String },
     #[error("fill is not complete")]

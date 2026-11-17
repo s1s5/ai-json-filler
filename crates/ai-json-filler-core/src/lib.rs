@@ -15,6 +15,7 @@ pub use error::FillError;
 pub use feedback::FeedbackOptions;
 pub use give_up::{DEFAULT_GIVE_UP_TOOL_NAME, GiveUp};
 pub use goal::{GoalEmpty, GoalPath};
+pub use prompt::{GuideMode, PromptAudit, PromptSection, PromptSectionSource, PromptSectionView};
 pub use schema::{FillSchema, GuideOptions, RootKind};
 pub use session::{ExtraKeys, FillOutcome, FillSession, PROMPT_VERSION, SessionResult};
 pub use tool::{Tool, ToolOutput, ToolSet, ToolSpec};
