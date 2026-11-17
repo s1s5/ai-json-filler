@@ -458,3 +458,224 @@ async fn give_up_auto_gate_without_tools() {
         SessionResult::Impossible { .. }
     ));
 }
+
+#[derive(Debug, Deserialize, JsonSchema, PartialEq)]
+struct Row {
+    name: String,
+    note: String,
+}
+
+fn array_session() -> FillSession<Vec<Row>> {
+    FillSession::new("行を埋めて").expect("session")
+}
+
+#[tokio::test]
+async fn array_mode_advertises_three_tools() {
+    let session = array_session();
+    let specs = session.tool_specs();
+    let names: Vec<String> = specs.iter().map(|spec| spec.name.clone()).collect();
+    assert!(names.iter().any(|n| n == "append"), "{names:?}");
+    assert!(names.iter().any(|n| n == "update"), "{names:?}");
+    assert!(names.iter().any(|n| n == "remove"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "save_result"), "{names:?}");
+}
+
+#[tokio::test]
+async fn array_tool_specs_are_valid_schemas() {
+    let session = array_session();
+    for spec in session.tool_specs() {
+        jsonschema::validator_for(&spec.parameters)
+            .unwrap_or_else(|err| panic!("{}: {err}", spec.name));
+    }
+}
+
+#[tokio::test]
+async fn array_tool_specs_include_defs_for_ref_items() {
+    let session = array_session();
+    let specs = session.tool_specs();
+    let append = specs.iter().find(|spec| spec.name == "append").unwrap();
+    let update = specs.iter().find(|spec| spec.name == "update").unwrap();
+    assert!(append.parameters.get("$defs").is_some());
+    assert!(update.parameters.get("$defs").is_some());
+}
+
+#[tokio::test]
+async fn append_partial_then_update_completes() {
+    let mut session = array_session();
+    match session
+        .call("append", json!({"items": [{"name": "A"}]}))
+        .await
+    {
+        SessionResult::Continue { content, .. } => {
+            assert!(content.contains("追加しました"), "{content}");
+            assert!(
+                content.contains("[0].note") || content.contains("note"),
+                "{content}"
+            );
+        }
+        other => {
+            let _ = other;
+            panic!("expected continue")
+        }
+    }
+    assert!(!session.is_done());
+
+    match session
+        .call("update", json!({"index": 0, "patch": {"note": "x"}}))
+        .await
+    {
+        SessionResult::Done { content } => assert!(content.contains("1件"), "{content}"),
+        other => {
+            let _ = other;
+            panic!("expected done")
+        }
+    }
+
+    let outcome = session.into_outcome().expect("outcome");
+    assert_eq!(
+        outcome.value,
+        vec![Row {
+            name: "A".to_string(),
+            note: "x".to_string(),
+        }]
+    );
+    assert_eq!(outcome.save_calls, 2);
+}
+
+#[tokio::test]
+async fn append_multiple_items() {
+    let mut session = array_session();
+    let result = session
+        .call(
+            "append",
+            json!({"items": [
+                {"name": "A", "note": "a"},
+                {"name": "B", "note": "b"}
+            ]}),
+        )
+        .await;
+    assert!(matches!(result, SessionResult::Done { .. }));
+    let outcome = session.into_outcome().expect("outcome");
+    assert_eq!(outcome.value.len(), 2);
+    assert_eq!(outcome.value[1].name, "B");
+}
+
+#[tokio::test]
+async fn update_merges_only_given_fields() {
+    let mut session = array_session();
+    let _ = session
+        .call("append", json!({"items": [{"name": "A"}]}))
+        .await;
+    let result = session
+        .call("update", json!({"index": 0, "patch": {"note": "x"}}))
+        .await;
+    assert!(matches!(result, SessionResult::Done { .. }));
+    assert_eq!(session.snapshot(), &json!([{"name": "A", "note": "x"}]));
+}
+
+#[tokio::test]
+async fn remove_shifts_indices() {
+    let mut session = array_session();
+    let _ = session
+        .call(
+            "append",
+            json!({"items": [{"name": "A"}, {"name": "B"}, {"name": "C"}]}),
+        )
+        .await;
+    let removed = session.call("remove", json!({"index": 1})).await;
+    assert!(matches!(removed, SessionResult::Continue { .. }));
+    assert_eq!(session.snapshot(), &json!([{"name": "A"}, {"name": "C"}]));
+
+    // The element that was at index 2 is now at index 1.
+    let _ = session
+        .call("update", json!({"index": 1, "patch": {"note": "c"}}))
+        .await;
+    let result = session
+        .call("update", json!({"index": 0, "patch": {"note": "a"}}))
+        .await;
+    assert!(matches!(result, SessionResult::Done { .. }));
+    assert_eq!(
+        session.snapshot(),
+        &json!([{"name": "A", "note": "a"}, {"name": "C", "note": "c"}])
+    );
+}
+
+#[tokio::test]
+async fn remove_out_of_range_is_rejected() {
+    let mut session = array_session();
+    let _ = session
+        .call("append", json!({"items": [{"name": "A"}]}))
+        .await;
+    let before = session.snapshot().clone();
+    match session.call("remove", json!({"index": 5})).await {
+        SessionResult::Continue { content, .. } => {
+            assert!(content.contains("範囲外"), "{content}");
+        }
+        other => {
+            let _ = other;
+            panic!("expected continue")
+        }
+    }
+    assert_eq!(session.snapshot(), &before);
+}
+
+#[tokio::test]
+async fn extra_key_in_append_is_stripped() {
+    let mut session = array_session();
+    let result = session
+        .call("append", json!({"items": [{"name": "A", "extra": true}]}))
+        .await;
+    assert!(matches!(result, SessionResult::Continue { .. }));
+    assert_eq!(session.snapshot(), &json!([{"name": "A"}]));
+    assert!(
+        session
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("[0].extra")),
+        "{:?}",
+        session.warnings()
+    );
+}
+
+#[tokio::test]
+async fn array_mode_seed_then_update() {
+    let mut session =
+        FillSession::<Vec<Row>>::with_seed("行を埋めて", json!([{"name": "A"}])).expect("session");
+    let result = session
+        .call("update", json!({"index": 0, "patch": {"note": "x"}}))
+        .await;
+    assert!(matches!(result, SessionResult::Done { .. }));
+    let outcome = session.into_outcome().expect("outcome");
+    assert_eq!(outcome.value[0].note, "x");
+}
+
+#[tokio::test]
+async fn array_mode_rejects_save_result() {
+    let mut session = array_session();
+    match session.call("save_result", json!({"name": "A"})).await {
+        SessionResult::Continue { content, is_error } => {
+            assert!(is_error);
+            assert!(content.contains("利用できません"), "{content}");
+        }
+        other => {
+            let _ = other;
+            panic!("expected tool error")
+        }
+    }
+}
+
+#[tokio::test]
+async fn array_mode_custom_tool_names() {
+    use ai_json_filler_core::ArrayToolNames;
+    let names = ArrayToolNames {
+        append: "add_rows".to_string(),
+        update: "patch_row".to_string(),
+        remove: "drop_row".to_string(),
+    };
+    let session = array_session().with_array_tool_names(names);
+    let specs = session.tool_specs();
+    let names: Vec<String> = specs.iter().map(|spec| spec.name.clone()).collect();
+    assert!(names.iter().any(|n| n == "add_rows"), "{names:?}");
+    assert!(names.iter().any(|n| n == "patch_row"), "{names:?}");
+    assert!(names.iter().any(|n| n == "drop_row"), "{names:?}");
+}

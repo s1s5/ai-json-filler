@@ -4,8 +4,10 @@ use crate::validation::ValidationIssue;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FillError {
-    #[error("root schema must be type=object with properties")]
+    #[error("root schema must be a flat object or an array of flat objects")]
     UnsupportedRootSchema,
+    #[error("unsupported schema shape at {path}: {reason}")]
+    UnsupportedSchemaShape { path: String, reason: String },
     #[error("invalid schema: {0}")]
     Schema(String),
     #[error("invalid seed: {issues:?}")]

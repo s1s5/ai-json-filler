@@ -63,6 +63,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 カスタムエンドポイント（Ollama の LAN サーバ等）を使う場合は `fill_target` に `genai::ServiceTarget` を渡す。`crates/ai-json-filler-genai/examples/fill_struct.rs` を参照。
 
+## 指定できる JSON の形
+
+充填対象は次の 2 モードのどちらか。モードはスキーマのルート型から自動判定する。
+
+| モード | ルート | 要素・フィールド | 例 |
+|---|---|---|---|
+| Object（既定） | フラットな object | スカラー、またはスカラー配列 | `struct Company { name: String, tags: Vec<String> }` |
+| Array（`is_array`） | object の配列 | 各要素はフラットな object | `Vec<Row>` |
+
+次の形は構築時に `FillError::UnsupportedSchemaShape { path, reason }` で拒否する。
+
+- ネストした object
+- Object モードのフィールドとしての object 配列
+- 配列の配列
+- map 型（`additionalProperties` がスキーマ）
+- 型未指定のフィールド
+
+Object モードのスカラー配列は、保存のたびに**配列全体を置換**する。部分的な追記はできない。
+
+## Array モード（`is_array`）
+
+`Vec<Row>` のように object の配列を指定すると Array モードになる。`save_result` の代わりに、次の 3 ツールが公開される。
+
+| ツール | 引数 | 役割 |
+|---|---|---|
+| `append` | `{"items": [{...}, ...]}` | 末尾に要素を追加。要素は部分的でよい |
+| `update` | `{"index": 0, "patch": {...}}` | 指定要素に `patch` をキー単位でマージ |
+| `remove` | `{"index": 0}` | 指定要素を削除。後ろの index は前に詰まる |
+
+```rust
+#[derive(Debug, Deserialize, JsonSchema)]
+struct Row {
+    /// 名前
+    name: String,
+    /// 備考
+    note: String,
+}
+
+let outcome = fill::<Vec<Row>>(&client, "qwen3:8b", "行を調べて埋めてください")
+    .run()
+    .await?;
+println!("{:#?}", outcome.value);
+```
+
+- 部分要素のまま `append` し、後から `update` で必須フィールドを埋められる。
+- `remove` の後は index がずれる。`update` / `remove` は現在の index を指定する。
+- 空配列がスキーマ上妥当なら、空で完了し得る。最低 1 件を要求する場合は `minItems: 1` をスキーマに入れる。
+- ツール名は `ArrayToolNames` で変更できる（`with_array_tool_names` / `array_tool_names`）。
+
 ## ツールを使う
 
 ```rust
@@ -167,12 +216,14 @@ match fill::<CompanyProfile>(&client, "qwen3:8b", "調べて").run().await {
 
 - **保存ツール名**: 既定は `save_result`（`ai_json_filler_core::DEFAULT_SAVE_TOOL_NAME`）。core は `FillSession::with_save_tool_name("store_fields")`、genai は `.save_tool_name("store_fields")` で変更できる。空文字・空白のみの名前は無視され、既定のままになる。
 
+- **形状制約**: ルートはフラット object またはフラット object の配列。ネスト object / object 配列 / map / 型未指定は `FillError::UnsupportedSchemaShape` で構築時に拒否する。`$ref` はローカル参照（`#/...`）のみ解決する。
+- **Array モード**: 既定のツール名は `append` / `update` / `remove`。`ArrayToolNames` で変更できる。各ツールの引数スキーマには、`items` の `$ref` を解決できるよう `$defs` / `definitions` をコピーする。`save_calls` は3ツールの呼び出し回数も数える。
 - **seed**: `FillSession::with_seed` は既存の部分データを受け取る。`required` 不足だけを許容し、型違い・enum 違反・余計キーは `FillError::InvalidSeed` で拒否する。
-- **余計キー**: `save_result` が送ってきた余計キーは検証前に除去し、`FillOutcome::warnings` に残す。
-- **`additionalProperties`**: schemars 1 は素の struct に `additionalProperties: false` を付けないため、`FillSchema::for_type` 側で `properties` を持つオブジェクトに注入する。`anyOf` / `oneOf` は再帰し、`allOf` は `unevaluatedProperties: false` を使う。
+- **余計キー**: `save_result` / `append` / `update` が送ってきた余計キーは検証前に除去し、`FillOutcome::warnings` に残す。配列要素内の余計キーは `[0].extra` のようにパス付きで記録する。
+- **`additionalProperties`**: schemars 1 は素の struct に `additionalProperties: false` を付けないため、`FillSchema::for_type` 側で `properties` を持つオブジェクトに注入する。`anyOf` / `oneOf` は再帰し、`allOf` は `unevaluatedProperties: false` を使う。配列ルートでは `items` の object にも適用する。
 - **フィードバック**: 日本語固定。`FeedbackOptions` で件数・文字数上限を変更できる。
 - **バージョン**: `genai = "0.7"`（キャレット）。マイナー更新で API が変わった場合は `ai-json-filler-genai` だけを直す。
-- **未実装**: 英語フィードバック、トークン予算、自動リトライ、ストリーミング、rounds / usage の返却。
+- **未実装**: 英語フィードバック、トークン予算、自動リトライ、ストリーミング、rounds / usage の返却、配列の一括 update / remove、キー付きマージ。
 
 ## 検証
 

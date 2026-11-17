@@ -433,3 +433,39 @@ async fn custom_give_up_tool_name() {
             .any(|tool| matches!(&tool.name, ToolName::Custom(name) if name == "give_up"))
     );
 }
+
+#[derive(Debug, Deserialize, JsonSchema, PartialEq)]
+struct Row {
+    name: String,
+    note: String,
+}
+
+#[tokio::test]
+async fn fills_vec_struct_with_append_and_update() {
+    let backend = Arc::new(ScriptedBackend::new(vec![
+        response(vec![tool_call(
+            "1",
+            "append",
+            json!({"items": [{"name": "A"}]}),
+        )]),
+        response(vec![tool_call(
+            "2",
+            "update",
+            json!({"index": 0, "patch": {"note": "x"}}),
+        )]),
+    ]));
+
+    let outcome = fill_with_backend::<Vec<Row>>(backend, "調べて")
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.value,
+        vec![Row {
+            name: "A".to_string(),
+            note: "x".to_string(),
+        }]
+    );
+    assert_eq!(outcome.save_calls, 2);
+}

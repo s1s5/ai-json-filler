@@ -23,7 +23,13 @@ pub fn validate(validator: &Validator, value: &Value) -> Vec<ValidationIssue> {
 
 pub fn validate_seed(validator: &Validator, value: &Value) -> Result<(), Vec<ValidationIssue>> {
     let issues = validate(validator, value);
-    if issues.is_empty() || issues.iter().all(|i| i.keyword == "required") {
+    // A seed is allowed to be incomplete. Missing object fields (`required`)
+    // and a too-short array (`minItems`) are progress, not invalid data.
+    if issues.is_empty()
+        || issues
+            .iter()
+            .all(|i| i.keyword == "required" || i.keyword == "minItems")
+    {
         Ok(())
     } else {
         Err(issues)
@@ -54,6 +60,20 @@ mod tests {
             "additionalProperties": false
         }));
         assert!(schema.validate_seed(&json!({"title": "x"})).is_ok());
+    }
+
+    #[test]
+    fn seed_allows_too_short_array() {
+        let schema = schema(json!({
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "required": ["name"]
+            }
+        }));
+        assert!(schema.validate_seed(&json!([])).is_ok());
     }
 
     #[test]

@@ -84,6 +84,24 @@ pub(super) fn property_label(property: &Value) -> String {
 }
 
 pub(super) fn saved_line(accumulated: &Value) -> String {
+    if let Some(items) = accumulated.as_array() {
+        let mut out = format!("保存済み: {}件", items.len());
+        for (index, item) in items.iter().take(5).enumerate() {
+            let mut keys: Vec<&str> = item
+                .as_object()
+                .map(|obj| obj.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            keys.sort_unstable();
+            if !keys.is_empty() {
+                out.push_str(&format!("\n- [{index}] {}", keys.join(", ")));
+            }
+        }
+        if items.len() > 5 {
+            out.push_str(&format!("\n…他 {} 件", items.len() - 5));
+        }
+        return out;
+    }
+
     let mut keys: Vec<&str> = accumulated
         .as_object()
         .map(|obj| obj.keys().map(String::as_str).collect())

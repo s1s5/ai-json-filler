@@ -13,6 +13,10 @@
 //!   CRAWL4AI_URL   既定 http://crawl4ai.localhost
 //!
 //! Tavily は使わない（`WebTools::builder()` に Tavily キーを渡さない）。
+//!
+//! NOTE: 2026-11-17 のフラット化以降、ネスト前提のケース C / G は
+//! `UnsupportedSchemaShape` で FAIL する。Array モードの検証は
+//! `crates/ai-json-filler-genai/tests/loop.rs` を参照。
 
 use std::process::ExitCode;
 use std::sync::Arc;

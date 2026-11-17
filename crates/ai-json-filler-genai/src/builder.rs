@@ -2,7 +2,8 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use ai_json_filler_core::{
-    BoxFuture, FillError, FillOutcome, FillSession, SessionResult, Tool, ToolOutput, ToolSpec,
+    ArrayToolNames, BoxFuture, FillError, FillOutcome, FillSession, SessionResult, Tool,
+    ToolOutput, ToolSpec,
 };
 use genai::chat::{ChatMessage, ChatRequest, ContentPart, MessageContent, ToolResponse};
 use schemars::JsonSchema;
@@ -52,6 +53,7 @@ where
         tools: Vec::new(),
         save_tool_name: None,
         give_up_tool_name: None,
+        array_tool_names: None,
         max_turns: 3,
         max_rounds: 10,
         _marker: PhantomData,
@@ -70,6 +72,7 @@ pub struct GenaiFillBuilder<T> {
     tools: Vec<Arc<dyn Tool>>,
     save_tool_name: Option<String>,
     give_up_tool_name: Option<String>,
+    array_tool_names: Option<ArrayToolNames>,
     max_turns: usize,
     max_rounds: usize,
     _marker: PhantomData<fn() -> T>,
@@ -145,6 +148,12 @@ where
         self
     }
 
+    /// Override the names of the three tools used in array mode.
+    pub fn array_tool_names(mut self, names: ArrayToolNames) -> Self {
+        self.array_tool_names = Some(names);
+        self
+    }
+
     pub async fn run(self) -> Result<FillOutcome<T>, FillError> {
         let max_turns = self.max_turns.max(1);
         let max_rounds = self.max_rounds.max(1);
@@ -158,6 +167,9 @@ where
         }
         if let Some(name) = self.give_up_tool_name {
             session = session.with_give_up_tool_name(name);
+        }
+        if let Some(names) = self.array_tool_names {
+            session = session.with_array_tool_names(names);
         }
         for tool in self.tools {
             session.add_tool(tool);

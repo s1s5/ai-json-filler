@@ -5,11 +5,16 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use jsonschema::paths::Location;
+
 use crate::feedback::{FeedbackOptions, empty_args_feedback, format_validation_feedback};
 use crate::give_up::{self, DEFAULT_GIVE_UP_TOOL_NAME, GiveUp};
 use crate::prompt::{SAVE_DESCRIPTION, build_system_prompt};
-use crate::schema::{collect_extra_keys, deep_merge, strip_extra_keys};
-use crate::{DEFAULT_SAVE_TOOL_NAME, FillError, FillSchema, Tool, ToolSet, ToolSpec};
+use crate::schema::{collect_extra_keys, deep_merge, display_path, strip_extra_keys};
+use crate::{
+    ArrayToolNames, DEFAULT_SAVE_TOOL_NAME, FillError, FillSchema, RootKind, Tool, ToolSet,
+    ToolSpec,
+};
 
 pub enum SessionResult {
     Continue {
@@ -38,6 +43,7 @@ pub struct FillSession<T> {
     accumulated: Value,
     tools: ToolSet,
     save_tool_name: String,
+    array_tool_names: ArrayToolNames,
     give_up: Option<GiveUp>,
     give_up_tool_name: String,
     give_up_min_tool_calls: Option<usize>,
@@ -54,11 +60,24 @@ where
     T: DeserializeOwned + JsonSchema,
 {
     pub fn new(prompt: impl Into<String>) -> Result<Self, FillError> {
-        Self::with_seed(prompt, Value::Object(Default::default()))
+        let schema = FillSchema::for_type::<T>()?;
+        let seed = match schema.root_kind() {
+            RootKind::Object => Value::Object(Default::default()),
+            RootKind::Array => Value::Array(Vec::new()),
+        };
+        Self::from_parts(prompt, seed, schema)
     }
 
     pub fn with_seed(prompt: impl Into<String>, seed: Value) -> Result<Self, FillError> {
         let schema = FillSchema::for_type::<T>()?;
+        Self::from_parts(prompt, seed, schema)
+    }
+
+    fn from_parts(
+        prompt: impl Into<String>,
+        seed: Value,
+        schema: FillSchema,
+    ) -> Result<Self, FillError> {
         if let Err(issues) = schema.validate_seed(&seed) {
             return Err(FillError::InvalidSeed { issues });
         }
@@ -68,6 +87,7 @@ where
             accumulated: seed,
             tools: ToolSet::new(),
             save_tool_name: DEFAULT_SAVE_TOOL_NAME.to_string(),
+            array_tool_names: ArrayToolNames::default(),
             give_up: None,
             give_up_tool_name: DEFAULT_GIVE_UP_TOOL_NAME.to_string(),
             give_up_min_tool_calls: None,
@@ -92,7 +112,10 @@ where
     pub fn with_save_tool_name(mut self, name: impl Into<String>) -> Self {
         let name = name.into();
         let trimmed = name.trim();
-        if !trimmed.is_empty() && trimmed != self.give_up_tool_name {
+        if !trimmed.is_empty()
+            && trimmed != self.give_up_tool_name
+            && !self.array_tool_names.all().contains(&trimmed)
+        {
             self.save_tool_name = trimmed.to_string();
         }
         self
@@ -102,6 +125,39 @@ where
         &self.save_tool_name
     }
 
+    /// Override the three tool names used in array mode.
+    ///
+    /// Empty names, duplicate names, and names that collide with the save or
+    /// give-up tool are ignored as a set.
+    pub fn with_array_tool_names(mut self, names: ArrayToolNames) -> Self {
+        let Some(names) = names.normalized() else {
+            return self;
+        };
+        if names
+            .all()
+            .iter()
+            .any(|name| *name == self.save_tool_name || *name == self.give_up_tool_name)
+        {
+            return self;
+        }
+        self.array_tool_names = names;
+        self
+    }
+
+    pub fn array_tool_names(&self) -> &ArrayToolNames {
+        &self.array_tool_names
+    }
+
+    /// The top-level shape this session fills.
+    pub fn root_kind(&self) -> RootKind {
+        self.schema.root_kind()
+    }
+
+    /// Whether this session fills an array of flat objects.
+    pub fn is_array(&self) -> bool {
+        self.schema.is_array()
+    }
+
     /// Override the name of the tool that declares the goal unreachable.
     ///
     /// Empty or whitespace-only names are ignored, and so is a name already
@@ -109,7 +165,10 @@ where
     pub fn with_give_up_tool_name(mut self, name: impl Into<String>) -> Self {
         let name = name.into();
         let trimmed = name.trim();
-        if !trimmed.is_empty() && trimmed != self.save_tool_name {
+        if !trimmed.is_empty()
+            && trimmed != self.save_tool_name
+            && !self.array_tool_names.all().contains(&trimmed)
+        {
             self.give_up_tool_name = trimmed.to_string();
         }
         self
@@ -136,24 +195,32 @@ where
     pub fn system_prompt(&self) -> String {
         build_system_prompt(
             &self.prompt,
+            self.schema.root_kind(),
             &self.save_tool_name,
             &self.give_up_tool_name,
+            &self.array_tool_names,
             &self.tools,
         )
     }
 
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
-        let mut specs = vec![ToolSpec {
-            name: self.save_tool_name.clone(),
-            description: SAVE_DESCRIPTION.to_string(),
-            parameters: self.schema.partial().clone(),
-        }];
+        let mut specs = match self.schema.root_kind() {
+            RootKind::Object => vec![ToolSpec {
+                name: self.save_tool_name.clone(),
+                description: SAVE_DESCRIPTION.to_string(),
+                parameters: self.schema.partial().clone(),
+            }],
+            RootKind::Array => crate::array::specs(&self.schema, &self.array_tool_names),
+        };
+        let mut reserved: Vec<String> = specs.iter().map(|spec| spec.name.clone()).collect();
+        reserved.push(self.save_tool_name.clone());
         let give_up_spec = give_up::spec(&self.give_up_tool_name);
-        if give_up_spec.name != self.save_tool_name {
+        if !reserved.contains(&give_up_spec.name) {
+            reserved.push(give_up_spec.name.clone());
             specs.push(give_up_spec);
         }
         for spec in self.tools.specs() {
-            if spec.name != self.save_tool_name && spec.name != self.give_up_tool_name {
+            if !reserved.contains(&spec.name) {
                 specs.push(spec);
             }
         }
@@ -185,22 +252,27 @@ where
     /// Feedback for a turn that ended without a tool call.
     ///
     /// Always states that the JSON is still incomplete and lists the current
-    /// validation issues, so the model knows why it must call the save tool.
+    /// validation issues, so the model knows why it must call a mutation tool.
     pub fn progress_feedback(&self) -> String {
-        match self.schema.validate(&self.accumulated) {
-            Ok(()) => format!(
-                "JSONはまだ完了していません。{} を呼び出して結果を保存してください。",
-                self.save_tool_name
+        let action = match self.schema.root_kind() {
+            RootKind::Object => format!("{} を呼び出して", self.save_tool_name),
+            RootKind::Array => format!(
+                "{} / {} / {} のいずれかで",
+                self.array_tool_names.append,
+                self.array_tool_names.update,
+                self.array_tool_names.remove
             ),
+        };
+        match self.schema.validate(&self.accumulated) {
+            Ok(()) => format!("JSONはまだ完了していません。{action}結果を保存してください。"),
             Err(issues) => {
                 let lines: Vec<String> = issues
                     .iter()
                     .map(|issue| format!("- {}: {} ({})", issue.path, issue.keyword, issue.message))
                     .collect();
                 format!(
-                    "JSONはまだ埋まっていません。現在の検証エラー:\n{}\n{} を呼び出して、不足分を保存してください。\nどうしても埋められない場合は {} を呼んで理由を報告してください。",
+                    "JSONはまだ埋まっていません。現在の検証エラー:\n{}\n{action}不足分を保存してください。\nどうしても埋められない場合は {} を呼んで理由を報告してください。",
                     lines.join("\n"),
-                    self.save_tool_name,
                     self.give_up_tool_name
                 )
             }
@@ -219,7 +291,17 @@ where
                 missing_fields: give_up.missing_fields.clone(),
             };
         }
-        if name == self.save_tool_name {
+        if self.schema.is_array() {
+            if name == self.array_tool_names.append {
+                return self.append(args);
+            }
+            if name == self.array_tool_names.update {
+                return self.update(args);
+            }
+            if name == self.array_tool_names.remove {
+                return self.remove(args);
+            }
+        } else if name == self.save_tool_name {
             return self.save(args);
         }
         if name == self.give_up_tool_name {
@@ -292,7 +374,78 @@ where
 
         let mut candidate = self.accumulated.clone();
         deep_merge(&mut candidate, &args);
+        self.commit_candidate(candidate, "")
+    }
 
+    fn append(&mut self, args: Value) -> SessionResult {
+        self.save_calls += 1;
+        let items = match crate::array::parse_append(&args) {
+            Ok(items) => items,
+            Err(message) => return validation_error(message),
+        };
+        let mut candidate = self.accumulated.clone();
+        let Some(array) = candidate.as_array_mut() else {
+            return validation_error("内部状態が配列ではありません。".to_string());
+        };
+        let first = array.len();
+        array.extend(items.iter().cloned());
+        let len = array.len();
+        let prefix = format!(
+            "{}\n",
+            crate::array::appended_message(first, items.len(), len)
+        );
+        self.commit_candidate(candidate, &prefix)
+    }
+
+    fn update(&mut self, args: Value) -> SessionResult {
+        self.save_calls += 1;
+        let (index, patch) = match crate::array::parse_update(&args) {
+            Ok(update) => update,
+            Err(message) => return validation_error(message),
+        };
+        let len = self.accumulated.as_array().map(Vec::len).unwrap_or(0);
+        if index >= len {
+            return SessionResult::Continue {
+                content: crate::array::range_error(index, len),
+                is_error: false,
+            };
+        }
+        let mut candidate = self.accumulated.clone();
+        let Some(array) = candidate.as_array_mut() else {
+            return validation_error("内部状態が配列ではありません。".to_string());
+        };
+        deep_merge(&mut array[index], &patch);
+        let prefix = format!("{}\n", crate::array::updated_message(index));
+        self.commit_candidate(candidate, &prefix)
+    }
+
+    fn remove(&mut self, args: Value) -> SessionResult {
+        self.save_calls += 1;
+        let index = match crate::array::parse_remove(&args) {
+            Ok(index) => index,
+            Err(message) => return validation_error(message),
+        };
+        let len = self.accumulated.as_array().map(Vec::len).unwrap_or(0);
+        if index >= len {
+            return SessionResult::Continue {
+                content: crate::array::range_error(index, len),
+                is_error: false,
+            };
+        }
+        let mut candidate = self.accumulated.clone();
+        let Some(array) = candidate.as_array_mut() else {
+            return validation_error("内部状態が配列ではありません。".to_string());
+        };
+        array.remove(index);
+        let prefix = format!("{}\n", crate::array::removed_message(index, array.len()));
+        self.commit_candidate(candidate, &prefix)
+    }
+
+    /// Validate a candidate, strip extra keys, and commit it.
+    ///
+    /// `prefix` is the operation result shown above validation feedback (for
+    /// example, `追加しました（[0]）`). It is empty for object-mode saves.
+    fn commit_candidate(&mut self, mut candidate: Value, prefix: &str) -> SessionResult {
         if self.schema.validate(&candidate).is_ok() {
             self.accumulated = candidate;
             self.done = true;
@@ -306,8 +459,8 @@ where
         let removed = strip_extra_keys(&mut candidate, &extras);
         let errors: Vec<_> = self.schema.validator().iter_errors(&candidate).collect();
 
-        for (_, key) in &removed {
-            let warning = format!("余計なキーを無視しました: {key}");
+        for (loc, key) in &removed {
+            let warning = warning_message(loc, key);
             if !self.warnings.contains(&warning) {
                 self.warnings.push(warning);
             }
@@ -324,18 +477,24 @@ where
         let feedback = format_validation_feedback(&errors, &candidate, &removed, &self.feedback);
         self.accumulated = candidate;
         SessionResult::Continue {
-            content: feedback,
+            content: format!("{prefix}{feedback}"),
             is_error: false,
         }
     }
 
     fn done_content(&self) -> String {
-        let keys: Vec<&str> = self
-            .accumulated
-            .as_object()
-            .map(|o| o.keys().map(String::as_str).collect())
-            .unwrap_or_default();
-        format!("保存しました（保存済み: {}）", keys.join(", "))
+        match &self.accumulated {
+            Value::Array(items) => format!("保存しました（{}件）", items.len()),
+            Value::Object(_) => {
+                let keys: Vec<&str> = self
+                    .accumulated
+                    .as_object()
+                    .map(|o| o.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                format!("保存しました（保存済み: {}）", keys.join(", "))
+            }
+            _ => "保存しました".to_string(),
+        }
     }
 
     pub fn into_outcome(self) -> Result<FillOutcome<T>, FillError> {
@@ -358,5 +517,21 @@ where
         Err(FillError::Incomplete {
             partial: self.accumulated,
         })
+    }
+}
+
+fn validation_error(message: String) -> SessionResult {
+    SessionResult::Continue {
+        content: format!("VALIDATION_ERROR: {message}"),
+        is_error: false,
+    }
+}
+
+fn warning_message(loc: &Location, key: &str) -> String {
+    let path = display_path(loc);
+    if path == "(root)" {
+        format!("余計なキーを無視しました: {key}")
+    } else {
+        format!("余計なキーを無視しました: {path}.{key}")
     }
 }
