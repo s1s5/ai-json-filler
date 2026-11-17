@@ -44,11 +44,15 @@ impl PromptSection {
     ];
 
     /// The sections `system_prompt()` is made of, in joined order.
+    ///
+    /// The guide comes last, after the language rules: that is where the
+    /// pre-section `system_prompt()` appended it, and the default prompt must
+    /// keep the same bytes.
     pub const SYSTEM: [Self; 4] = [
         Self::SaveInstructions,
-        Self::Guide,
         Self::ToolHints,
         Self::LanguageRules,
+        Self::Guide,
     ];
 }
 
@@ -584,6 +588,32 @@ mod tests {
     }
 
     #[test]
+    fn substitute_keeps_unclosed_braces() {
+        let names = ArrayToolNames::default();
+        let object = parts(RootKind::Object, "save_result", &names, "give_up", "f");
+        assert_eq!(
+            substitute("a {save", PromptSection::StartMessage, &object).unwrap(),
+            "a {save"
+        );
+        assert_eq!(
+            substitute("a } b", PromptSection::StartMessage, &object).unwrap(),
+            "a } b"
+        );
+    }
+
+    #[test]
+    fn substitute_keeps_double_braces() {
+        let names = ArrayToolNames::default();
+        let object = parts(RootKind::Object, "save_result", &names, "give_up", "f");
+        // 外側の `{` から最初の `}` までが `{save` で、識別子形ではない。
+        // エスケープ記法ではないので、そのまま残る。
+        assert_eq!(
+            substitute("{{save}}", PromptSection::StartMessage, &object).unwrap(),
+            "{{save}}"
+        );
+    }
+
+    #[test]
     fn save_description_forbids_path_keys() {
         assert!(
             SAVE_DESCRIPTION.contains("キーに `.` や `[0]` を付けず"),
@@ -633,9 +663,20 @@ mod tests {
             out.push_str(&render_section(section, &p));
         }
         assert!(out.starts_with("\n\n【保存の手順】\n"), "{out}");
-        assert!(out.contains("【ヒント】"), "{out}");
-        let language = out.find("【言語】").expect("language section");
-        let guide = out.find("【保存する JSON の形】").expect("guide section");
-        assert!(guide < language, "{out}");
+
+        // 旧実装と同じ並び: 保存の手順 → ツールヒント → 言語 → ガイド。
+        let order = [
+            "【保存の手順】",
+            "【ヒント】",
+            "【言語】",
+            "【保存する JSON の形】",
+        ];
+        let mut cursor = 0usize;
+        for heading in order {
+            let at = out[cursor..]
+                .find(heading)
+                .unwrap_or_else(|| panic!("{heading} missing or out of order: {out}"));
+            cursor += at;
+        }
     }
 }

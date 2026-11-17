@@ -237,13 +237,15 @@ LLM 無しで 4 ステップを実演する例が `crates/ai-json-filler-core/ex
 
 どの文字列がモデルに届き、どのノブで制御できるか。順序は固定で、並べ替えは提供しない（保存手順が言語ルールの後ろに来ると壊れるため）。
 
+表の順序がそのまま system プロンプトの順序（`PromptSection::SYSTEM`）。
+
 | 部分 | 届く先 | 既定のノブ | 差し替え / 無効化 |
 |---|---|---|---|
 | タスク文 | system の先頭 | `FillSession::new(prompt)` | `prompt()` で読める。差し替えは不可 |
 | 【保存の手順】 | system | ツール名から自動 | `PromptSection::SaveInstructions` |
-| 【保存する JSON の形】/【要素の形】 | system | `with_schema_guide` / `with_guide_mode` / `with_guide_options` | `PromptSection::Guide`（テンプレートに `{fields}` 必須） |
-| ツールヒント | system（言語ルールの前） | `Tool::prompt_hint()` | `PromptSection::ToolHints` |
-| 【言語】 | system の末尾 | 日本語固定 | `PromptSection::LanguageRules` |
+| ツールヒント | system | `Tool::prompt_hint()` | `PromptSection::ToolHints` |
+| 【言語】 | system | 日本語固定 | `PromptSection::LanguageRules` |
+| 【保存する JSON の形】/【要素の形】 | system の末尾（【言語】の後） | `with_schema_guide` / `with_guide_mode` / `with_guide_options` | `PromptSection::Guide`（テンプレートに `{fields}` 必須） |
 | 開始メッセージ | 最初の user | モードのツール名から自動 | `PromptSection::StartMessage` |
 | 強制保存メッセージ | `force_save_after` 到達時の user | モードのツール名から自動 | `PromptSection::SaveOnlyMessage` |
 
@@ -268,6 +270,7 @@ let session = FillSession::<CompanyProfile>::new("調べて")?
 - プレースホルダと見なすのは**識別子形**（`{` と `}` の間を trim して、空でなく英小文字と `_` だけ）の波括弧だけ。`{"name": "x"}` のような JSON の例や `{1}`・`{}`・`{Save}` はそのままの文字として出力される。`{ save }` は trim されて `save` として置換される。`{save}` という文字列そのものを出したいときのエスケープは無い。
 - 置換は 1 パスで、置換した値が再度展開されることはない。
 - `without_prompt_section` は既定文面を消す。`with_prompt_section` で差し替えたセクションも消える。`reset_prompt_section` で既定に戻る。
+- `StartMessage` を無効化すると **user メッセージを 1 つも送らない**（system だけで始まる）。user ターンを必須にするプロバイダでは無効化しないこと。
 - 既定の文面をそのまま残したいセクションは触らない。差し替えていないセクションは従来どおりに描画される。
 - genai ビルダーでは `.prompt_section(...)` / `.without_prompt_section(...)` / `.guide_mode(...)`。検証は `run()` がセッションを組み立てるときに行われる（モードが型パラメータで決まるため）。
 
@@ -305,9 +308,11 @@ assert!(audit.warnings.is_empty(), "{:?}", audit.warnings); // 既定構成は�
 let audit = session.prompt_audit().allow("save_result");
 ```
 
-- 警告の例: 配列モードなのに `save_result` がプロンプトに残っている（今回のバグと同根）、公開している保存ツール名が文面に無い、`give_up` がどこにも無い、`save_tool_name` を配列モードで設定している。
-- genai の `run()` は監査を自動で回し、結果を `FillOutcome::warnings` に合流させる（既存の警告と同じ Vec）。
-- CI で `prompt_audit().warnings.is_empty()` を回すと、既定構成の退行を検出できる。
+- 警告の例: 配列モードなのに `save_result` がプロンプトに残っている（今回のバグと同根。保存名を変えた場合も既定名の残骸を検査する）、公開している保存ツール名が文面に無い、`give_up` がどこにも無い、`save_tool_name` を配列モードで設定している。
+- `without_prompt_section` で無効化したセクションは検査しない（送らないものを警告しても意味がない）。
+- 同名の調査ツールが登録されている `save_result` は正当なので警告しない。
+- genai の `run()` は監査を自動で回し、結果を `FillOutcome::warnings`（`Ok` 経路）に合流させる。意図して出している名前は `.prompt_audit_allow("name")`（core は `with_prompt_audit_allowed([...])`）で除外できる。
+- **`FillError::Impossible` / `Incomplete` では警告が付かない**（`FillOutcome` 自体が返らないため）。CI で退行を検出したいときは `prompt_audit()` を直接呼ぶ。
 
 ## プロンプトに入るフィールド一覧
 
@@ -417,13 +422,13 @@ let outcome = fill::<CompanyProfile>(&client, "qwen3:8b", "調べて")
 // outcome.prompt_version == "save-contract-v4+stock-3"
 ```
 
-**版を上げる規律**: `SAVE_DESCRIPTION`・`LANGUAGE_RULES`・ガイドの見出し（`guide_body`）・`goal_feedback` の文面・`budget_message`・`start_message`・`save_only_message` を変えたら `PROMPT_VERSION` を上げる。テンプレートがスキーマ・ツール名・タスク文で動的なためハッシュでは検出できない。開始メッセージと強制保存メッセージは genai 側にあった時代に版へ反映されていなかったため、core への移設と同時に `v4` へ上げた。上げ忘れは PR のチェック項目で防ぐ。
+**版を上げる規律**: `SAVE_DESCRIPTION`・`LANGUAGE_RULES`・ガイドの見出し（`guide_body`）・`goal_feedback` の文面・`budget_message`・`start_message`・`save_only_message` を変えたら `PROMPT_VERSION` を上げる。テンプレートがスキーマ・ツール名・タスク文で動的なためハッシュでは検出できない。`v4` は既定の文面を変えていない。開始メッセージ・強制保存メッセージが genai 側にあった時代は版に反映されておらず、core の所有へ移したうえで版の管理対象に入れたことを示すための版上げ（出力の変更ではない）。上げ忘れは PR のチェック項目で防ぐ。
 
 差し替え API（`with_prompt_section` / `without_prompt_section`）と `GuideMode` の追加は**既定の出力を変えない**ので版を上げない。既定文面そのものを変えたときだけ上げる。
 
 ## 設計上の注意
 
-- **保存ツール名**: 既定は `save_result`（`ai_json_filler_core::DEFAULT_SAVE_TOOL_NAME`）。core は `FillSession::with_save_tool_name("store_fields")`、genai は `.save_tool_name("store_fields")` で変更できる。空文字・空白のみの名前は無視され、既定のままになる。Array モードではこの名前は使わない（ツール一覧・開始メッセージ・強制保存メッセージは `ArrayToolNames` から作る）。give-up 名・配列ツール名と衝突した場合は無視され、**その旨が `warnings()` / `FillOutcome::warnings` に残る**（無言で落とさない）。衝突は「後から適用した側が負ける」ので、genai ビルダーは Array モードで配列名を先に適用する（配列名が勝つ）。設定ミスを警告ではなくエラーにしたい場合は `try_with_save_tool_name` / `try_with_array_tool_names` / `try_with_give_up_tool_name`（genai は `try_save_tool_name` など）を使う。
+- **保存ツール名**: 既定は `save_result`（`ai_json_filler_core::DEFAULT_SAVE_TOOL_NAME`）。core は `FillSession::with_save_tool_name("store_fields")`、genai は `.save_tool_name("store_fields")` で変更できる。空文字・空白のみの名前は無視され、既定のままになる。Array モードではこの名前は使わない（ツール一覧・開始メッセージ・強制保存メッセージは `ArrayToolNames` から作る）。give-up 名・配列ツール名と衝突した場合は無視され、**その旨が `warnings()` / `FillOutcome::warnings` に残る**（無言で落とさない）。衝突は「後から適用した側が負ける」ので、genai ビルダーは Array モードで配列名を先に適用する（配列名が勝つ）。設定ミスを警告ではなくエラーにしたい場合は `try_with_save_tool_name` / `try_with_array_tool_names` / `try_with_give_up_tool_name`（genai は `try_save_tool_name` など）を使う。genai の `try_*` は**その名前だけ**を厳格にする（`.try_give_up_tool_name(...)` を足しても、保存名・配列名は警告のまま）。
 
 - **形状制約**: ルートはフラット object またはフラット object の配列。ネスト object / object 配列 / map / 型未指定は `FillError::UnsupportedSchemaShape` で構築時に拒否する。`$ref` はローカル参照（`#/...`）のみ解決する。
 - **Array モード**: 既定のツール名は `append` / `update` / `remove`。`ArrayToolNames` で変更できる。各ツールの引数スキーマには、`items` の `$ref` を解決できるよう `$defs` / `definitions` をコピーする。`save_calls` は3ツールの呼び出し回数も数える。

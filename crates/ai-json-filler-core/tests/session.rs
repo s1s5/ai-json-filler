@@ -2164,12 +2164,10 @@ fn rendered_sections_join_into_the_system_prompt() {
     let session = new_session()
         .with_prompt_section(PromptSection::Guide, "【保存する形】\n{fields}")
         .expect("guide");
-    let joined: String = session
-        .prompt_sections()
-        .iter()
-        .filter(|(section, _)| PromptSection::SYSTEM.contains(section))
-        .map(|(_, view)| view.rendered.as_str())
-        .collect();
+    let mut joined = String::new();
+    for section in PromptSection::SYSTEM {
+        joined.push_str(&session.prompt_section(section).rendered);
+    }
     assert_eq!(
         format!("{}{}", session.prompt(), joined),
         session.system_prompt()
@@ -2302,4 +2300,125 @@ fn guide_template_accepts_spaced_fields() {
     assert!(guide.contains("【形】"), "{guide}");
     assert!(guide.contains("- name: string  (必須)"), "{guide}");
     assert!(!guide.contains("{ fields }"), "{guide}");
+}
+
+// --- レビュー指摘の回帰テスト ---
+
+#[test]
+fn default_prompt_keeps_the_parent_section_order() {
+    let mut session = new_session();
+    session.add_tool(Arc::new(HintedTool));
+
+    let prompt = session.system_prompt();
+    // 旧実装: build_system_prompt（…→ヒント→【言語】）の後にガイドを append。
+    let order = [
+        "【保存の手順】",
+        "【補足】",
+        "【言語】",
+        "【保存する JSON の形】",
+    ];
+    let mut cursor = 0usize;
+    for heading in order {
+        let at = prompt[cursor..]
+            .find(heading)
+            .unwrap_or_else(|| panic!("{heading} missing or out of order: {prompt}"));
+        cursor += at;
+    }
+}
+
+#[test]
+fn prompt_audit_skips_disabled_sections() {
+    let session = array_session()
+        .without_prompt_section(PromptSection::StartMessage)
+        .without_prompt_section(PromptSection::SaveOnlyMessage)
+        .without_prompt_section(PromptSection::Guide)
+        .without_prompt_section(PromptSection::ToolHints)
+        .without_prompt_section(PromptSection::LanguageRules);
+
+    assert!(
+        session.prompt_audit().warnings.is_empty(),
+        "{:?}",
+        session.prompt_audit().warnings
+    );
+}
+
+#[test]
+fn prompt_audit_flags_leftover_default_save_name() {
+    let session = array_session()
+        .with_save_tool_name("store")
+        .with_prompt_section(
+            PromptSection::StartMessage,
+            "store で保存する。save_result は使わない",
+        )
+        .expect("literal name");
+
+    let warnings = session.prompt_audit().warnings;
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("save_result")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn prompt_audit_ignores_a_registered_tool_named_save_result() {
+    let mut session = array_session()
+        .with_prompt_section(
+            PromptSection::StartMessage,
+            "save_result は調査ツールです。保存は append / update / remove で行う",
+        )
+        .expect("literal name");
+    session.add_tool(Arc::new(CountingTool::new("save_result")));
+
+    assert!(
+        session.prompt_audit().warnings.is_empty(),
+        "{:?}",
+        session.prompt_audit().warnings
+    );
+}
+
+#[test]
+fn with_prompt_audit_allowed_suppresses_named_warnings() {
+    let session = new_session()
+        .with_prompt_section(PromptSection::StartMessage, "結果は保存しない")
+        .expect("section")
+        .with_prompt_audit_allowed(["save_result"]);
+
+    assert!(session.warnings().is_empty(), "{:?}", session.warnings());
+}
+
+#[test]
+fn array_names_after_trimming_cannot_collide_with_the_save_name() {
+    let session = array_session()
+        .with_save_tool_name("store")
+        .with_array_tool_names(ai_json_filler_core::ArrayToolNames {
+            append: " store ".to_string(),
+            update: "patch_row".to_string(),
+            remove: "drop_row".to_string(),
+        });
+
+    assert_eq!(session.array_tool_names().append, "append");
+    assert!(
+        session
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("配列ツール名")),
+        "{:?}",
+        session.warnings()
+    );
+}
+
+#[test]
+fn array_names_are_stored_trimmed() {
+    let session = array_session().with_array_tool_names(ai_json_filler_core::ArrayToolNames {
+        append: " add ".to_string(),
+        update: " patch ".to_string(),
+        remove: " drop ".to_string(),
+    });
+
+    let names = session.array_tool_names();
+    assert_eq!(names.append, "add");
+    assert_eq!(names.update, "patch");
+    assert_eq!(names.remove, "drop");
 }

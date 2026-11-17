@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use ai_json_filler_core::{
-    BoxFuture, ExtraKeys, FeedbackOptions, FillError, PromptSection, ToolOutput,
+    BoxFuture, ExtraKeys, FeedbackOptions, FillError, GuideMode, PromptSection, ToolOutput,
 };
 use ai_json_filler_genai::{ChatBackend, fill_with_backend};
 use genai::ModelIden;
@@ -1141,5 +1141,147 @@ async fn strict_tool_name_is_an_error_at_run() {
     assert!(
         matches!(error, FillError::InvalidToolName { .. }),
         "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn guide_mode_fields_drops_the_tool_name_sentence() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "save_result",
+        json!({"name": "x", "employees": 1}),
+    )])]));
+
+    fill_with_backend::<Company>(backend.clone(), "調べて")
+        .guide_mode(GuideMode::Fields)
+        .run()
+        .await
+        .unwrap();
+
+    let system = backend.requests()[0].system.clone().expect("system prompt");
+    assert!(system.contains("【保存する JSON の形】"), "{system}");
+    assert!(system.contains("- name: string  (必須)"), "{system}");
+    assert!(
+        !system.contains("save_result の引数は"),
+        "the guide must not name the save tool: {system}"
+    );
+}
+
+#[tokio::test]
+async fn without_prompt_section_drops_language_rules() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "save_result",
+        json!({"name": "x", "employees": 1}),
+    )])]));
+
+    fill_with_backend::<Company>(backend.clone(), "調べて")
+        .without_prompt_section(PromptSection::LanguageRules)
+        .run()
+        .await
+        .unwrap();
+
+    let system = backend.requests()[0].system.clone().expect("system prompt");
+    assert!(!system.contains("【言語】"), "{system}");
+    assert!(system.contains("【保存の手順】"), "{system}");
+}
+
+#[tokio::test]
+async fn without_start_message_sends_no_user_message() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "save_result",
+        json!({"name": "x", "employees": 1}),
+    )])]));
+
+    let outcome = fill_with_backend::<Company>(backend.clone(), "調べて")
+        .without_prompt_section(PromptSection::StartMessage)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(outcome.value.employees, 1);
+
+    let request = &backend.requests()[0];
+    assert!(request.messages.is_empty(), "{:?}", request.messages);
+    assert!(request.system.as_deref().is_some_and(|s| !s.is_empty()));
+}
+
+#[tokio::test]
+async fn prompt_section_replaces_the_force_save_message() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "save_result",
+        json!({"name": "x", "employees": 1}),
+    )])]));
+
+    fill_with_backend::<Company>(backend.clone(), "調べて")
+        .prompt_section(PromptSection::SaveOnlyMessage, "締め: {save} を呼ぶ")
+        .force_save_after(0)
+        .run()
+        .await
+        .unwrap();
+
+    let text = conversation_text(&backend.requests()[0]);
+    assert!(text.contains("締め: save_result を呼ぶ"), "{text}");
+    assert!(!text.contains("これ以上は調査できません"), "{text}");
+}
+
+#[tokio::test]
+async fn try_give_up_name_does_not_make_other_names_strict() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "append",
+        json!({"items": [{"name": "A", "note": "n"}]}),
+    )])]));
+
+    // 配列名が保存名と衝突するので、寛容な setter なら警告で済む。
+    // `try_give_up_tool_name` は give-up 名だけを厳格にする。
+    let outcome = fill_with_backend::<Vec<Row>>(backend, "調べて")
+        .array_tool_names(ai_json_filler_core::ArrayToolNames {
+            append: "save_result".to_string(),
+            update: "patch_row".to_string(),
+            remove: "drop_row".to_string(),
+        })
+        .try_give_up_tool_name("cannot_complete")
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.value.len(), 1);
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("配列ツール名")),
+        "{:?}",
+        outcome.warnings
+    );
+}
+
+#[tokio::test]
+async fn prompt_audit_allow_removes_the_named_warning() {
+    let backend = Arc::new(ScriptedBackend::new(vec![response(vec![tool_call(
+        "1",
+        "append",
+        json!({"items": [{"name": "A", "note": "n"}]}),
+    )])]));
+
+    let outcome = fill_with_backend::<Vec<Row>>(backend, "調べて")
+        .prompt_section(
+            PromptSection::StartMessage,
+            "append / update / remove / give_up を使う。save_result は移行用の旧名",
+        )
+        .prompt_audit_allow("save_result")
+        .run()
+        .await
+        .unwrap();
+
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("save_result")),
+        "{:?}",
+        outcome.warnings
     );
 }

@@ -373,10 +373,29 @@ where
     /// This never fails: a renamed tool is legitimate, so an unfamiliar name
     /// is reported, not rejected. The default configuration reports nothing;
     /// asserting `prompt_audit().warnings.is_empty()` in a test pins that.
+    /// A section removed with [`Self::without_prompt_section`] is not inspected.
     pub fn prompt_audit(&self) -> PromptAudit {
-        let system = self.system_prompt();
-        let start = self.start_message();
-        let save_only = self.save_only_message();
+        let system_enabled = PromptSection::SYSTEM
+            .iter()
+            .any(|section| !self.overrides.is_disabled(*section));
+        let start_enabled = !self.overrides.is_disabled(PromptSection::StartMessage);
+        let save_only_enabled = !self.overrides.is_disabled(PromptSection::SaveOnlyMessage);
+
+        let system = if system_enabled {
+            self.system_prompt()
+        } else {
+            String::new()
+        };
+        let start = if start_enabled {
+            self.start_message()
+        } else {
+            String::new()
+        };
+        let save_only = if save_only_enabled {
+            self.save_only_message()
+        } else {
+            String::new()
+        };
         let mut audit = PromptAudit::default();
 
         let advertised: Vec<&str> = match self.schema.root_kind() {
@@ -384,27 +403,29 @@ where
             RootKind::Array => self.array_tool_names.all().to_vec(),
         };
         for name in &advertised {
-            if !system.contains(name) {
+            if system_enabled && !system.contains(name) {
                 audit.warn(format!(
                     "保存ツール名 '{name}' がシステムプロンプトに含まれていません"
                 ));
             }
-            if !start.contains(name) {
+            if start_enabled && !start.contains(name) {
                 audit.warn(format!(
                     "保存ツール名 '{name}' が開始メッセージに含まれていません"
                 ));
             }
-            if !save_only.contains(name) {
+            if save_only_enabled && !save_only.contains(name) {
                 audit.warn(format!(
                     "保存ツール名 '{name}' が強制保存メッセージに含まれていません"
                 ));
             }
         }
 
-        if !system.contains(&self.give_up_tool_name) && !start.contains(&self.give_up_tool_name) {
+        let give_up = self.give_up_tool_name.as_str();
+        let give_up_present = (system_enabled && system.contains(give_up))
+            || (start_enabled && start.contains(give_up));
+        if (system_enabled || start_enabled) && !give_up_present {
             audit.warn(format!(
-                "give-up ツール名 '{}' がプロンプトに含まれていません",
-                self.give_up_tool_name
+                "give-up ツール名 '{give_up}' がプロンプトに含まれていません"
             ));
         }
 
@@ -414,11 +435,25 @@ where
                 audit.warn(format!(
                     "save_tool_name '{save}' は配列モードでは使われません（設定ミス）"
                 ));
-            } else if !self.tools.contains(save)
-                && (system.contains(save) || start.contains(save) || save_only.contains(save))
-            {
+            }
+            // 保存名を変えたときに、既定名（`save_result`）の残骸を見逃さない。
+            let mut unused = vec![DEFAULT_SAVE_TOOL_NAME];
+            if save != DEFAULT_SAVE_TOOL_NAME {
+                unused.push(save);
+            }
+            for name in unused {
+                // 同名の調査ツールは正当な使い方なので警告しない。
+                if self.tools.contains(name) {
+                    continue;
+                }
+                let mentioned = (system_enabled && system.contains(name))
+                    || (start_enabled && start.contains(name))
+                    || (save_only_enabled && save_only.contains(name));
+                if !mentioned {
+                    continue;
+                }
                 audit.warn(format!(
-                    "配列モードでは使われない保存ツール名 '{save}' がプロンプトに含まれています"
+                    "配列モードでは使われない保存ツール名 '{name}' がプロンプトに含まれています"
                 ));
             }
         }
@@ -428,8 +463,22 @@ where
 
     /// Run [`Self::prompt_audit`] now and merge the warnings into
     /// [`Self::warnings`], so they end up in [`FillOutcome::warnings`].
-    pub fn with_prompt_audit(mut self) -> Self {
-        for warning in self.prompt_audit().warnings {
+    pub fn with_prompt_audit(self) -> Self {
+        self.with_prompt_audit_allowed(std::iter::empty::<&str>())
+    }
+
+    /// [`Self::with_prompt_audit`], dropping warnings that mention any of
+    /// `allows` (see [`PromptAudit::allow`]).
+    pub fn with_prompt_audit_allowed<I, S>(mut self, allows: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut audit = self.prompt_audit();
+        for name in allows {
+            audit = audit.allow(name);
+        }
+        for warning in audit.warnings {
             self.push_warning(warning);
         }
         self
@@ -509,37 +558,44 @@ where
     /// their defaults rather than leaving a half-renamed trio. The ignored call
     /// is reported through [`Self::warnings`].
     pub fn with_array_tool_names(mut self, names: ArrayToolNames) -> Self {
-        match self.array_names_problem(&names) {
-            Some(reason) => self.push_warning(format!("配列ツール名を無視しました: {reason}")),
-            None => self.array_tool_names = names.normalized().expect("checked above"),
+        match self.normalized_array_names(&names) {
+            Ok(normalized) => self.array_tool_names = normalized,
+            Err(reason) => self.push_warning(format!("配列ツール名を無視しました: {reason}")),
         }
         self
     }
 
     /// [`Self::with_array_tool_names`], but an unusable set is an error.
     pub fn try_with_array_tool_names(mut self, names: ArrayToolNames) -> Result<Self, FillError> {
-        if let Some(reason) = self.array_names_problem(&names) {
-            return Err(FillError::InvalidToolName {
-                name: format!("{}/{}/{}", names.append, names.update, names.remove),
-                reason,
-            });
-        }
-        self.array_tool_names = names.normalized().expect("checked above");
+        let normalized =
+            self.normalized_array_names(&names)
+                .map_err(|reason| FillError::InvalidToolName {
+                    name: format!("{}/{}/{}", names.append, names.update, names.remove),
+                    reason,
+                })?;
+        self.array_tool_names = normalized;
         Ok(self)
     }
 
-    fn array_names_problem(&self, names: &ArrayToolNames) -> Option<String> {
-        if names.clone().normalized().is_none() {
-            return Some("名前が空か重複しています".to_string());
-        }
-        if names
+    /// Trim the three names once, then check the trimmed set for emptiness,
+    /// duplicates, and collisions.
+    ///
+    /// Returns the set that will actually be used, so the names that were
+    /// checked and the names that are stored cannot differ (`append: " x "`
+    /// must collide with a save tool named `x`).
+    fn normalized_array_names(&self, names: &ArrayToolNames) -> Result<ArrayToolNames, String> {
+        let normalized = names
+            .clone()
+            .normalized()
+            .ok_or_else(|| "名前が空か重複しています".to_string())?;
+        if normalized
             .all()
             .iter()
             .any(|name| *name == self.save_tool_name || *name == self.give_up_tool_name)
         {
-            return Some("保存ツール名または give-up ツール名と衝突しています".to_string());
+            return Err("保存ツール名または give-up ツール名と衝突しています".to_string());
         }
-        None
+        Ok(normalized)
     }
 
     pub fn array_tool_names(&self) -> &ArrayToolNames {
@@ -680,6 +736,10 @@ where
     /// [`ArrayToolNames`] の 3 ツールを名指しする。Array モードでは
     /// `save_result` がツール一覧に無いので、ここでも出さない。
     /// どちらのモードでも [`Self::give_up_tool_name`] を含める。
+    ///
+    /// [`Self::without_prompt_section`] で無効化すると空文字を返す。ホストは
+    /// その場合 user メッセージを送らないこと（空の user を送るプロバイダが
+    /// あるため）。genai のループはそれに従う。
     pub fn start_message(&self) -> String {
         let parts = self.prompt_parts();
         self.section_text(PromptSection::StartMessage, &parts)
@@ -731,11 +791,15 @@ where
         }
         if let Some(template) = self.overrides.template(section) {
             // `with_prompt_section` already rendered this template against the
-            // same mode, and the mode never changes afterwards. Falling back to
-            // an empty string keeps `system_prompt()` infallible.
+            // same mode, and the mode never changes afterwards, so this cannot
+            // fail. If it ever does, show the built-in text instead of silently
+            // dropping the section from the prompt.
             return match substitute(template, section, parts) {
                 Ok(body) => crate::prompt::section_block(section, body),
-                Err(_) => String::new(),
+                Err(_) => {
+                    debug_assert!(false, "prompt section failed to render: {section}");
+                    render_section(section, parts)
+                }
             };
         }
         render_section(section, parts)

@@ -54,7 +54,9 @@ where
         save_tool_name: None,
         give_up_tool_name: None,
         array_tool_names: None,
-        strict_tool_names: false,
+        strict_save_name: false,
+        strict_array_names: false,
+        strict_give_up_name: false,
         goal_fields: Vec::new(),
         goal_empty: None,
         extra_keys: None,
@@ -64,6 +66,7 @@ where
         feedback_options: None,
         prompt_sections: Vec::new(),
         disabled_sections: Vec::new(),
+        audit_allowed: Vec::new(),
         tool_budgets: Vec::new(),
         prompt_version: None,
         force_save_after: None,
@@ -86,9 +89,11 @@ pub struct GenaiFillBuilder<T> {
     save_tool_name: Option<String>,
     give_up_tool_name: Option<String>,
     array_tool_names: Option<ArrayToolNames>,
-    /// Set by the `try_*` name setters: a name that cannot be applied is then
-    /// an error instead of a warning.
-    strict_tool_names: bool,
+    /// Set by the matching `try_*` name setter: that name is then an error when
+    /// it cannot be applied, instead of a warning.
+    strict_save_name: bool,
+    strict_array_names: bool,
+    strict_give_up_name: bool,
     goal_fields: Vec<String>,
     goal_empty: Option<GoalEmpty>,
     extra_keys: Option<ExtraKeys>,
@@ -98,6 +103,9 @@ pub struct GenaiFillBuilder<T> {
     feedback_options: Option<FeedbackOptions>,
     prompt_sections: Vec<(PromptSection, String)>,
     disabled_sections: Vec<PromptSection>,
+    /// Names the prompt audit must not warn about (see
+    /// [`ai_json_filler_core::PromptAudit::allow`]).
+    audit_allowed: Vec<String>,
     tool_budgets: Vec<(String, usize)>,
     prompt_version: Option<String>,
     force_save_after: Option<usize>,
@@ -177,7 +185,7 @@ where
     /// [`Self::save_tool_name`], but a name that cannot be used is an error
     /// when [`Self::run`] starts instead of a warning.
     pub fn try_save_tool_name(mut self, name: impl Into<String>) -> Self {
-        self.strict_tool_names = true;
+        self.strict_save_name = true;
         self.save_tool_name = Some(name.into());
         self
     }
@@ -192,7 +200,7 @@ where
     /// [`Self::give_up_tool_name`], with strict validation (see
     /// [`Self::try_save_tool_name`]).
     pub fn try_give_up_tool_name(mut self, name: impl Into<String>) -> Self {
-        self.strict_tool_names = true;
+        self.strict_give_up_name = true;
         self.give_up_tool_name = Some(name.into());
         self
     }
@@ -206,7 +214,7 @@ where
     /// [`Self::array_tool_names`], with strict validation (see
     /// [`Self::try_save_tool_name`]).
     pub fn try_array_tool_names(mut self, names: ArrayToolNames) -> Self {
-        self.strict_tool_names = true;
+        self.strict_array_names = true;
         self.array_tool_names = Some(names);
         self
     }
@@ -276,8 +284,21 @@ where
         self
     }
 
+    /// Do not warn about `name` in the prompt audit.
+    ///
+    /// Use it for a name the prompt mentions on purpose, such as a tool that
+    /// was renamed in a migration message.
+    pub fn prompt_audit_allow(mut self, name: impl Into<String>) -> Self {
+        self.audit_allowed.push(name.into());
+        self
+    }
+
     /// Drop a prompt section. A section that was also replaced by
     /// [`Self::prompt_section`] is dropped, because this is applied last.
+    ///
+    /// Dropping [`PromptSection::StartMessage`] sends no user message at all
+    /// (the request carries only the system prompt). Do not drop it for a
+    /// provider that requires at least one user turn.
     pub fn without_prompt_section(mut self, section: PromptSection) -> Self {
         self.disabled_sections.push(section);
         self
@@ -322,17 +343,18 @@ where
         };
         // 名前の衝突は「後から適用した側が無視される」。Array モードで実際に
         // 使われるのは配列名なので、先に適用して勝たせる。
-        let strict = self.strict_tool_names;
+        let strict_array = self.strict_array_names;
+        let strict_save = self.strict_save_name;
         if session.is_array() {
             if let Some(names) = self.array_tool_names {
-                session = if strict {
+                session = if strict_array {
                     session.try_with_array_tool_names(names)?
                 } else {
                     session.with_array_tool_names(names)
                 };
             }
             if let Some(name) = self.save_tool_name {
-                session = if strict {
+                session = if strict_save {
                     session.try_with_save_tool_name(name)?
                 } else {
                     session.with_save_tool_name(name)
@@ -340,14 +362,14 @@ where
             }
         } else {
             if let Some(name) = self.save_tool_name {
-                session = if strict {
+                session = if strict_save {
                     session.try_with_save_tool_name(name)?
                 } else {
                     session.with_save_tool_name(name)
                 };
             }
             if let Some(names) = self.array_tool_names {
-                session = if strict {
+                session = if strict_array {
                     session.try_with_array_tool_names(names)?
                 } else {
                     session.with_array_tool_names(names)
@@ -355,7 +377,7 @@ where
             }
         }
         if let Some(name) = self.give_up_tool_name {
-            session = if strict {
+            session = if self.strict_give_up_name {
                 session.try_with_give_up_tool_name(name)?
             } else {
                 session.with_give_up_tool_name(name)
@@ -398,8 +420,15 @@ where
             session.add_tool(tool);
         }
         // 監査は登録済みのツール名も見るので、ツール追加の後に行う。
-        session = session.with_prompt_audit();
-        let mut messages: Vec<ChatMessage> = vec![ChatMessage::user(session.start_message())];
+        session = session.with_prompt_audit_allowed(self.audit_allowed);
+        // StartMessage を無効化したセッションは user メッセージを 1 つも
+        // 送らない（空文字の user を積むとプロバイダ次第で失敗する）。
+        let start = session.start_message();
+        let mut messages: Vec<ChatMessage> = if start.is_empty() {
+            Vec::new()
+        } else {
+            vec![ChatMessage::user(start)]
+        };
         let force_save_message = session.save_only_message();
 
         let mut turns = 0usize;
